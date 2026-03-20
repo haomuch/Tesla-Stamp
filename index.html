@@ -1,0 +1,1412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="icon.png" type="image/png">
+    <meta name="mobile-web-app-capable" content="yes">
+    <link rel="apple-touch-icon" href="icon.png">
+    <script src="public/mp4-muxer.min.js"></script>
+    <script src="public/protobuf.min.js"></script>
+    <script>
+        /**
+         * Tesla Dashcam MP4 Parser
+         * Parses MP4 files and extracts SEI metadata from Tesla dashcam footage.
+         */
+        class DashcamMP4 {
+            constructor(buffer) {
+                this.buffer = buffer;
+                this.view = new DataView(buffer);
+                this._config = null;
+                this._samples = null;
+            }
+
+            findBox(start, end, name) {
+                for (let pos = start; pos + 8 <= end;) {
+                    let size = this.view.getUint32(pos);
+                    const type = this.readAscii(pos + 4, 4);
+                    const headerSize = size === 1 ? 16 : 8;
+
+                    if (size === 1) {
+                        const high = this.view.getUint32(pos + 8);
+                        const low = this.view.getUint32(pos + 12);
+                        size = Number((BigInt(high) << 32n) | BigInt(low));
+                    } else if (size === 0) {
+                        size = end - pos;
+                    }
+
+                    if (type === name) {
+                        return { start: pos + headerSize, end: pos + size, size: size - headerSize };
+                    }
+                    pos += size;
+                }
+                throw new Error(`Box "${name}" not found`);
+            }
+
+            findMdat() {
+                const mdat = this.findBox(0, this.view.byteLength, 'mdat');
+                return { offset: mdat.start, size: mdat.size };
+            }
+
+            getConfig() {
+                if (this._config) return this._config;
+
+                const moov = this.findBox(0, this.view.byteLength, 'moov');
+                const trak = this.findBox(moov.start, moov.end, 'trak');
+                const mdia = this.findBox(trak.start, trak.end, 'mdia');
+                const minf = this.findBox(mdia.start, mdia.end, 'minf');
+                const stbl = this.findBox(minf.start, minf.end, 'stbl');
+                const stsd = this.findBox(stbl.start, stbl.end, 'stsd');
+                const avc1 = this.findBox(stsd.start + 8, stsd.end, 'avc1');
+                const avcC = this.findBox(avc1.start + 78, avc1.end, 'avcC');
+
+                const o = avcC.start;
+                const codec = `avc1.${this.hex(this.view.getUint8(o + 1))}${this.hex(this.view.getUint8(o + 2))}${this.hex(this.view.getUint8(o + 3))}`;
+
+                let p = o + 6;
+                const spsLen = this.view.getUint16(p);
+                const sps = new Uint8Array(this.buffer.slice(p + 2, p + 2 + spsLen));
+                p += 2 + spsLen + 1;
+                const ppsLen = this.view.getUint16(p);
+                const pps = new Uint8Array(this.buffer.slice(p + 2, p + 2 + ppsLen));
+
+                const mdhd = this.findBox(mdia.start, mdia.end, 'mdhd');
+                const mdhdVersion = this.view.getUint8(mdhd.start);
+                const timescale = mdhdVersion === 1
+                    ? this.view.getUint32(mdhd.start + 20)
+                    : this.view.getUint32(mdhd.start + 12);
+
+                const stts = this.findBox(stbl.start, stbl.end, 'stts');
+                const entryCount = this.view.getUint32(stts.start + 4);
+                const durations = [];
+                let pos = stts.start + 8;
+                for (let i = 0; i < entryCount; i++) {
+                    const count = this.view.getUint32(pos);
+                    const delta = this.view.getUint32(pos + 4);
+                    const ms = (delta / timescale) * 1000;
+                    for (let j = 0; j < count; j++) durations.push(ms);
+                    pos += 8;
+                }
+
+                this._config = {
+                    width: this.view.getUint16(avc1.start + 24),
+                    height: this.view.getUint16(avc1.start + 26),
+                    codec, sps, pps, timescale, durations,
+                    avcC: new Uint8Array(this.buffer, avcC.start, avcC.size)
+                };
+                return this._config;
+            }
+
+            getSamples() {
+                if (this._samples) return this._samples;
+
+                const config = this.getConfig();
+                const moov = this.findBox(0, this.view.byteLength, 'moov');
+                const trak = this.findBox(moov.start, moov.end, 'trak');
+                const mdia = this.findBox(trak.start, trak.end, 'mdia');
+                const minf = this.findBox(mdia.start, mdia.end, 'minf');
+                const stbl = this.findBox(minf.start, minf.end, 'stbl');
+
+                const stsz = this.findBox(stbl.start, stbl.end, 'stsz');
+                const sampleSizeDefault = this.view.getUint32(stsz.start + 4);
+                const sampleCount = this.view.getUint32(stsz.start + 8);
+                const sampleSizes = [];
+                if (sampleSizeDefault === 0) {
+                    for (let i = 0; i < sampleCount; i++) sampleSizes.push(this.view.getUint32(stsz.start + 12 + i * 4));
+                } else {
+                    for (let i = 0; i < sampleCount; i++) sampleSizes.push(sampleSizeDefault);
+                }
+
+                let chunkOffsets = [];
+                try {
+                    const stco = this.findBox(stbl.start, stbl.end, 'stco');
+                    const entryCount = this.view.getUint32(stco.start + 4);
+                    for (let i = 0; i < entryCount; i++) chunkOffsets.push(this.view.getUint32(stco.start + 8 + i * 4));
+                } catch {
+                    const co64 = this.findBox(stbl.start, stbl.end, 'co64');
+                    const entryCount = this.view.getUint32(co64.start + 4);
+                    for (let i = 0; i < entryCount; i++) chunkOffsets.push(Number(this.view.getBigUint64(co64.start + 8 + i * 8)));
+                }
+
+                const stsc = this.findBox(stbl.start, stbl.end, 'stsc');
+                const stscEntries = this.view.getUint32(stsc.start + 4);
+                const sampleToChunk = [];
+                for (let i = 0; i < stscEntries; i++) {
+                    sampleToChunk.push({
+                        firstChunk: this.view.getUint32(stsc.start + 8 + i * 12),
+                        samplesPerChunk: this.view.getUint32(stsc.start + 12 + i * 12)
+                    });
+                }
+
+                const keyframes = new Set();
+                try {
+                    const stss = this.findBox(stbl.start, stbl.end, 'stss');
+                    const entryCount = this.view.getUint32(stss.start + 4);
+                    for (let i = 0; i < entryCount; i++) keyframes.add(this.view.getUint32(stss.start + 8 + i * 4) - 1);
+                } catch {
+                    keyframes.add(0);
+                }
+
+                const samples = [];
+                let currentSample = 0;
+                let currentTimeUs = 0;
+
+                for (let i = 0; i < chunkOffsets.length; i++) {
+                    const chunkIdx = i + 1;
+                    const stscEntry = sampleToChunk.reduce((prev, cur) => (chunkIdx >= cur.firstChunk ? cur : prev));
+                    let offset = chunkOffsets[i];
+
+                    for (let j = 0; j < stscEntry.samplesPerChunk; j++) {
+                        if (currentSample >= sampleCount) break;
+                        const size = sampleSizes[currentSample];
+                        const durationMs = config.durations[currentSample] || (1000 / 36);
+
+                        samples.push({
+                            data: new Uint8Array(this.buffer, offset, size),
+                            timestamp: Math.round(currentTimeUs),
+                            duration: Math.round(durationMs * 1000),
+                            type: keyframes.has(currentSample) ? 'key' : 'delta'
+                        });
+
+                        offset += size;
+                        currentTimeUs += durationMs * 1000;
+                        currentSample++;
+                    }
+                }
+                this._samples = samples;
+                return this._samples;
+            }
+
+            getCreationTime() {
+                try {
+                    const moov = this.findBox(0, this.view.byteLength, 'moov');
+                    const mvhd = this.findBox(moov.start, moov.end, 'mvhd');
+                    const version = this.view.getUint8(mvhd.start);
+                    const secondsSince1904 = version === 1
+                        ? Number(this.view.getBigUint64(mvhd.start + 4))
+                        : this.view.getUint32(mvhd.start + 4);
+
+                    if (secondsSince1904 === 0) return null;
+                    return (secondsSince1904 - 2082844800) * 1000;
+                } catch (e) {
+                    return null;
+                }
+            }
+
+            parseFrames(SeiMetadata) {
+                const mdat = this.findMdat();
+                const frames = [];
+                let cursor = mdat.offset;
+                const end = mdat.offset + mdat.size;
+                let pendingSei = null;
+
+                while (cursor + 4 <= end) {
+                    const len = this.view.getUint32(cursor);
+                    cursor += 4;
+                    if (len < 1 || cursor + len > this.view.byteLength) break;
+
+                    const type = this.view.getUint8(cursor) & 0x1F;
+
+                    if (type === 6) {
+                        const data = new Uint8Array(this.buffer.slice(cursor, cursor + len));
+                        pendingSei = this.decodeSei(data, SeiMetadata);
+                    } else if (type === 5 || type === 1) {
+                        frames.push({ sei: pendingSei });
+                        pendingSei = null;
+                    }
+                    cursor += len;
+                }
+                return frames;
+            }
+
+            decodeSei(nal, SeiMetadata) {
+                if (!SeiMetadata || nal.length < 4) return null;
+
+                let i = 3;
+                while (i < nal.length && nal[i] === 0x42) i++;
+                if (i <= 3 || i + 1 >= nal.length || nal[i] !== 0x69) return null;
+
+                try {
+                    return SeiMetadata.decode(this.stripEmulationBytes(nal.subarray(i + 1, nal.length - 1)));
+                } catch {
+                    return null;
+                }
+            }
+
+            stripEmulationBytes(data) {
+                const out = [];
+                let zeros = 0;
+                for (const byte of data) {
+                    if (zeros >= 2 && byte === 0x03) { zeros = 0; continue; }
+                    out.push(byte);
+                    zeros = byte === 0 ? zeros + 1 : 0;
+                }
+                return Uint8Array.from(out);
+            }
+
+            readAscii(start, len) {
+                let s = '';
+                for (let i = 0; i < len; i++) s += String.fromCharCode(this.view.getUint8(start + i));
+                return s;
+            }
+
+            hex(n) { return n.toString(16).padStart(2, '0'); }
+        }
+
+        window.DashcamMP4 = DashcamMP4;
+
+        (function () {
+            let SeiMetadata = null;
+            let enumFields = null;
+
+            async function initProtobuf() {
+                if (SeiMetadata) return { SeiMetadata, enumFields };
+
+                const protoText = `
+                syntax = "proto3";
+                message SeiMetadata {
+                uint32 version = 1;
+                enum Gear { GEAR_PARK = 0; GEAR_DRIVE = 1; GEAR_REVERSE = 2; GEAR_NEUTRAL = 3; }
+                Gear gear_state = 2;
+                uint64 frame_seq_no = 3;
+                float vehicle_speed_mps = 4;
+                float accelerator_pedal_position = 5;
+                float steering_wheel_angle = 6;
+                bool blinker_on_left = 7;
+                bool blinker_on_right = 8;
+                bool brake_applied = 9;
+                enum AutopilotState { NONE = 0; FULL = 1; AUTO = 2; TACC = 3; }
+                AutopilotState autopilot_state = 10;
+                double latitude_deg = 11;
+                double longitude_deg = 12;
+                double heading_deg = 13;
+                double linear_acceleration_mps2_x = 14;
+                double linear_acceleration_mps2_y = 15;
+                double linear_acceleration_mps2_z = 16;
+                }`;
+
+                const root = protobuf.parse(protoText).root;
+                SeiMetadata = root.lookupType('SeiMetadata');
+                enumFields = {
+                    gearState: SeiMetadata.lookup('Gear'),
+                    autopilotState: SeiMetadata.lookup('AutopilotState'),
+                    gear_state: SeiMetadata.lookup('Gear'),
+                    autopilot_state: SeiMetadata.lookup('AutopilotState')
+                };
+                return { SeiMetadata, enumFields };
+            }
+
+            window.DashcamHelpers = { initProtobuf };
+        })();
+    </script>
+    <title>Tesla Dashcam Stamp</title>
+    <style>
+        /* 样式部分保持不变 */
+        :root {
+            --tesla-red: #e82127;
+            --bg-black: #050505;
+            --card-bg: rgba(20, 20, 20, 0.7);
+            --card-hover: rgba(30, 30, 30, 0.8);
+            --text-primary: #ffffff;
+            --text-secondary: #a1a1a1;
+            --accent-glow: rgba(232, 33, 39, 0.3);
+            --transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            --glass-bg: rgba(10, 10, 10, 0.8);
+            --glass-border: rgba(255, 255, 255, 0.08);
+        }
+
+        * {
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-black);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+            align-items: center;
+            overflow-x: hidden;
+            background-image: radial-gradient(circle at 50% -20%, var(--accent-glow) 0%, transparent 50%),
+                radial-gradient(circle at 0% 100%, rgba(20, 20, 20, 0.5) 0%, transparent 40%);
+        }
+
+        .app-header {
+            width: 100%;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            position: relative;
+            z-index: 10;
+        }
+
+        .app-header h1 {
+            font-size: 24px;
+            font-weight: 700;
+            letter-spacing: 6px;
+            text-transform: uppercase;
+            margin: 0;
+            background: linear-gradient(135deg, #fff 0%, #a1a1a1 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .app-header .subtitle {
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-top: 8px;
+            letter-spacing: 2px;
+            font-weight: 500;
+        }
+
+        .main-content {
+            width: 100%;
+            max-width: 800px;
+            padding: 0 20px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            position: relative;
+            z-index: 5;
+        }
+
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: 16px;
+            padding: 12px;
+            transition: var(--transition);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            padding: 4px 0;
+        }
+
+        .card-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+            letter-spacing: 1px;
+        }
+
+        .guide-steps {
+            list-style: none;
+            padding: 0;
+            margin: 8px 0 0 0;
+            font-size: 14px;
+            color: var(--text-secondary);
+            transition: var(--transition);
+            max-height: 100px;
+            opacity: 1;
+            overflow: hidden;
+        }
+
+        .guide-steps.collapsed {
+            max-height: 0;
+            opacity: 0;
+            margin-top: 0;
+        }
+
+        .guide-steps li {
+            margin-bottom: 10px;
+            display: flex;
+            gap: 10px;
+            align-items: flex-start;
+            line-height: 1.5;
+        }
+
+        .guide-steps li::before {
+            content: "";
+            width: 6px;
+            height: 6px;
+            background: var(--tesla-red);
+            border-radius: 50%;
+            margin-top: 6px;
+            flex-shrink: 0;
+        }
+
+        .toggle-icon {
+            font-size: 12px;
+            transition: var(--transition);
+            opacity: 0.5;
+        }
+
+        .toggle-icon.collapsed {
+            transform: rotate(-180deg);
+        }
+
+        .upload-zone {
+            position: relative;
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 2px dashed var(--glass-border);
+            border-radius: 24px;
+            padding: 60px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: var(--transition);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .upload-zone:hover {
+            border-color: var(--tesla-red);
+            background: var(--card-hover);
+        }
+
+        .upload-zone.active {
+            border-color: var(--tesla-red);
+            background: rgba(232, 33, 39, 0.1);
+        }
+
+        .upload-icon {
+            width: 64px;
+            height: 64px;
+            background: rgba(232, 33, 39, 0.1);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 8px;
+            transition: var(--transition);
+        }
+
+        .upload-zone:hover .upload-icon {
+            background: var(--tesla-red);
+        }
+
+        .upload-icon svg {
+            width: 32px;
+            height: 32px;
+            fill: var(--tesla-red);
+            transition: var(--transition);
+        }
+
+        .upload-zone:hover .upload-icon svg {
+            fill: white;
+        }
+
+        .upload-zone p {
+            font-size: 16px;
+            margin: 0;
+            color: var(--text-secondary);
+        }
+
+        .inputer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
+            z-index: 10;
+        }
+
+        .viewer {
+            width: 100%;
+            background: #000;
+            overflow: hidden;
+            border: 1px solid var(--glass-border);
+            position: relative;
+            box-shadow: 0 20px 80px rgba(0, 0, 0, 0.6);
+            display: none;
+            animation: fadeIn 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .canvas-container {
+            width: 100%;
+            position: relative;
+            background: #000;
+            cursor: pointer;
+        }
+
+        canvas {
+            width: 100%;
+            display: block;
+        }
+
+        .controls-overlay {
+            padding: 24px;
+            background: linear-gradient(0deg, var(--glass-bg) 0%, transparent 100%);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            padding: 6px 14px;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            border: 1px solid var(--glass-border);
+        }
+
+        .reselect-btn {
+            background: rgba(232, 33, 39, 0.15);
+            border: 1px solid rgba(232, 33, 39, 0.3);
+            color: var(--tesla-red);
+            font-size: 11px;
+            padding: 6px 14px;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: var(--transition);
+            display: none;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }
+
+        .reselect-btn:hover {
+            background: var(--tesla-red);
+            color: white;
+            border-color: var(--tesla-red);
+            box-shadow: 0 4px 15px rgba(232, 33, 39, 0.4);
+        }
+
+        .status-badge.recording {
+            background: rgba(232, 33, 39, 0.1);
+            color: var(--tesla-red);
+            border-color: rgba(232, 33, 39, 0.2);
+        }
+
+        .status-badge.recording .dot {
+            width: 8px;
+            height: 8px;
+            background: var(--tesla-red);
+            border-radius: 50%;
+            animation: pulse 1.5s infinite;
+            box-shadow: 0 0 8px var(--tesla-red);
+        }
+
+        @keyframes pulse {
+            0% {
+                opacity: 1;
+                transform: scale(1);
+            }
+
+            50% {
+                opacity: 0.5;
+                transform: scale(1.2);
+            }
+
+            100% {
+                opacity: 1;
+                transform: scale(1);
+            }
+        }
+
+        .timeline-container {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .icon-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--glass-border);
+            color: var(--text-primary);
+            cursor: pointer;
+            padding: 0;
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            transition: var(--transition);
+        }
+
+        .icon-btn:disabled {
+            opacity: 0.2;
+            cursor: not-allowed;
+        }
+
+        .slider-container {
+            flex: 1;
+            position: relative;
+            height: 6px;
+            display: flex;
+            align-items: center;
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            outline: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            background: #fff;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: var(--transition);
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            background: var(--tesla-red);
+            transform: scale(1.2);
+            box-shadow: 0 0 15px var(--tesla-red);
+        }
+
+        .btn-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+
+        .btn {
+            height: 52px;
+            border: none;
+            border-radius: 14px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .btn-primary {
+            background: var(--tesla-red);
+            color: white;
+            box-shadow: 0 4px 15px rgba(232, 33, 39, 0.2);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: #ff2a31;
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(232, 33, 39, 0.4);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.05);
+            color: white;
+            border: 1px solid var(--glass-border);
+            backdrop-filter: blur(10px);
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: rgba(255, 255, 255, 0.1);
+            transform: translateY(-2px);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .btn:disabled {
+            opacity: 0.2;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+
+        @media (max-width: 600px) {
+            .app-header {
+                padding: 30px 20px;
+            }
+
+            .app-header h1 {
+                font-size: 20px;
+                letter-spacing: 4px;
+            }
+
+            .btn-group {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <header class="app-header">
+        <h1>Tesla Dashcam Stamp</h1>
+        <div class="subtitle">特斯拉行车记录仪水印工具</div>
+    </header>
+
+    <main class="main-content">
+        <section class="card guide-card">
+            <div class="card-header" id="guideHeader">
+                <div class="card-title">使用说明</div>
+                <div class="toggle-icon" id="toggleIcon">▼</div>
+            </div>
+            <ul class="guide-steps collapsed" id="guideSteps">
+                <li>导入原始视频文件，自动基于文件名添加水印</li>
+                <li>手机浏览器合成过程中，请勿切换到其他界面</li>
+                <li>所有文件都在客户端处理，不会上传到服务器</li>
+            </ul>
+        </section>
+
+        <section class="upload-zone" id="dropZone">
+            <div class="upload-icon">
+                <svg viewBox="0 0 24 24">
+                    <path
+                        d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z" />
+                </svg>
+            </div>
+            <p>选择原始视频文件</p>
+            <input class="inputer" type="file" accept="video/*" id="fileInput" />
+        </section>
+
+        <div class="viewer" id="videoViewer">
+            <div class="canvas-container">
+                <canvas class="cvs" id="videoCanvas"></canvas>
+            </div>
+
+            <div class="controls-overlay">
+                <div class="status-bar" style="display: flex; justify-content: space-between; align-items: center;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="status-badge" id="statusBadge">
+                            <span class="dot"></span>
+                            <span class="text">等待导入视频...</span>
+                        </div>
+                        <button class="reselect-btn" id="reselectBtn">更换视频</button>
+                    </div>
+                    <div id="timeDisplay"
+                        style="font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color: var(--text-secondary);">
+                        00:00 / 00:00</div>
+                </div>
+
+                <div class="timeline-container">
+                    <button class="icon-btn" id="playPauseBtn" title="播放/暂停">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                            <path d="M8 5v14l11-7z" />
+                        </svg>
+                    </button>
+                    <div class="slider-container">
+                        <input class="timeLine" type="range" min="0" max="1000" step="1" value="0" id="timeSlider" />
+                    </div>
+                </div>
+
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="startRecBtn" disabled>
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+                            <path
+                                d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z" />
+                            <circle cx="12" cy="12" r="5" />
+                        </svg>
+                        开始合成
+                    </button>
+                    <button class="btn btn-secondary" id="stopRecBtn" disabled>
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+                            <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+                        </svg>
+                        保存视频
+                    </button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        let fps = 36;
+        let targetBitrate = 6000000;
+        const MP4_EPOCH_OFFSET = 2082844800;
+        let originalMediaDate = null;
+        let originalFileLastModified = null;
+
+        const fileInput = document.querySelector("#fileInput");
+        const dropZone = document.querySelector("#dropZone");
+        const startRecBtn = document.querySelector("#startRecBtn");
+        const stopRecBtn = document.querySelector("#stopRecBtn");
+        const statusBadge = document.querySelector("#statusBadge");
+        const reselectBtn = document.querySelector("#reselectBtn");
+        const playPauseBtn = document.querySelector("#playPauseBtn");
+        const statusText = statusBadge.querySelector(".text");
+        const timeDisplay = document.querySelector("#timeDisplay");
+        const videoViewer = document.querySelector("#videoViewer");
+        const timeSlider = document.querySelector("#timeSlider");
+
+        // --- WebGL 2.0 Initialization ---
+        const cvs = document.querySelector("#videoCanvas");
+        const gl = cvs.getContext('webgl2', { alpha: false, antialias: false, depth: false });
+
+        if (!gl) {
+            alert("您的浏览器不支持 WebGL 2.0，无法运行此渲染管线。");
+        }
+
+        // Shaders
+        const vsSource = `#version 300 es
+        in vec4 a_position;
+        in vec2 a_texCoord;
+        out vec2 v_texCoord;
+        void main() {
+            gl_Position = a_position;
+            // WebGL texture coordinates origin is bottom-left.
+            v_texCoord = vec2(a_texCoord.x, 1.0 - a_texCoord.y);
+        }`;
+
+        const fsSource = `#version 300 es
+        precision highp float;
+        in vec2 v_texCoord;
+        uniform sampler2D u_videoTex;
+        uniform sampler2D u_textTex;
+        out vec4 outColor;
+        
+        void main() {
+            vec4 vidColor = texture(u_videoTex, v_texCoord);
+            vec4 textColor = texture(u_textTex, v_texCoord);
+            
+            // Alpha blending text over video
+            outColor = mix(vidColor, textColor, textColor.a);
+        }`;
+
+        function compileShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error("Shader compile error:", gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+        const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+        const program = gl.createProgram();
+        gl.attachShader(program, vertexShader);
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program);
+
+        const positionLoc = gl.getAttribLocation(program, "a_position");
+        const texCoordLoc = gl.getAttribLocation(program, "a_texCoord");
+        const videoTexLoc = gl.getUniformLocation(program, "u_videoTex");
+        const textTexLoc = gl.getUniformLocation(program, "u_textTex");
+
+        // Fullscreen quad
+        const positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0
+        ]), gl.STATIC_DRAW);
+
+        const texCoordBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0
+        ]), gl.STATIC_DRAW);
+
+        const videoTexture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+
+        const textTexture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, textTexture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+
+        // Offscreen Canvas for Text Rendering (The Atlas)
+        const textCanvas = document.createElement('canvas');
+        const textCtx = textCanvas.getContext('2d', { willReadFrequently: false });
+        let lastRenderedTimeStr = "";
+        let lastRenderedSeiStr = "";
+
+        let cachedCanvasWidth = -1;
+        let cachedCanvasHeight = -1;
+        let cachedFontSize = 0;
+        let cachedTextWidth = 0;
+
+        // UI toggles
+        const guideHeader = document.querySelector("#guideHeader");
+        const guideSteps = document.querySelector("#guideSteps");
+        const toggleIcon = document.querySelector("#toggleIcon");
+
+        guideHeader.onclick = () => {
+            guideSteps.classList.toggle("collapsed");
+            toggleIcon.classList.toggle("collapsed");
+        };
+
+        let vid = null;
+        let dragging = false;
+        let vidName = "tesla_dashcam";
+        let videoStartTime = 0;
+        let isRecording = false;
+        let animationId = null;
+        let currentVideoUrl = null;
+
+        let parsedFrames = [];
+        let enumFields = null;
+        let currentParser = null;
+        const reusableDate = new Date();
+
+        const createFreshVideo = () => {
+            const old = document.getElementById("hiddenVideo");
+            if (old) {
+                old.pause();
+                if (currentVideoUrl) { URL.revokeObjectURL(currentVideoUrl); currentVideoUrl = null; }
+                old.removeAttribute('src'); old.load();
+                if (old._readyPollTimer) { clearInterval(old._readyPollTimer); old._readyPollTimer = null; }
+                old.remove();
+            }
+            const v = document.createElement("video");
+            v.id = "hiddenVideo"; v.muted = true;
+            v.setAttribute("playsinline", "true");
+            v.setAttribute("webkit-playsinline", "true");
+            v.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0.01;pointer-events:none;z-index:-1;";
+            document.body.appendChild(v);
+            return v;
+        };
+
+        const formatTime = (seconds) => {
+            const m = Math.floor(seconds / 60); const s = Math.floor(seconds % 60);
+            return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+        };
+
+        const formatDate = (date) => {
+            const pad = (n) => n.toString().padStart(2, '0');
+            return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+        };
+
+        const syncPlayButton = (isPaused) => {
+            playPauseBtn.innerHTML = isPaused
+                ? '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'
+                : '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
+        };
+
+        const patchMp4Metadata = (buffer, creationTime) => {
+            const view = new DataView(buffer);
+            const bigCreationTime = BigInt(creationTime);
+            const targets = new Set([0x6D766864, 0x746B6864, 0x6D646864]);
+            const containers = new Set([0x6D6F6F76, 0x7472616B, 0x6D646961]);
+
+            const patchBoxes = (start, end) => {
+                let offset = start;
+                while (offset + 8 <= end) {
+                    const boxSize = view.getUint32(offset);
+                    const boxType = view.getUint32(offset + 4);
+                    if (boxSize < 8 || offset + boxSize > end) break;
+                    if (targets.has(boxType)) {
+                        const version = view.getUint8(offset + 8);
+                        const dataOffset = offset + 12;
+                        if (version === 0 && dataOffset + 8 <= end) {
+                            view.setUint32(dataOffset, Number(creationTime));
+                            view.setUint32(dataOffset + 4, Number(creationTime));
+                        } else if (version === 1 && dataOffset + 16 <= end) {
+                            view.setBigUint64(dataOffset, bigCreationTime);
+                            view.setBigUint64(dataOffset + 8, bigCreationTime);
+                        }
+                    } else if (containers.has(boxType)) {
+                        patchBoxes(offset + 8, offset + boxSize);
+                    }
+                    offset += boxSize;
+                }
+            };
+            patchBoxes(0, buffer.byteLength); return buffer;
+        };
+
+        let muxer = null, encoder = null, frameCount = 0;
+        const checkCapabilities = () => !!(typeof Mp4Muxer !== 'undefined' && window.VideoEncoder && window.VideoFrame);
+
+        const updateStatus = (text, isRec = false) => {
+            statusText.textContent = text;
+            isRec ? statusBadge.classList.add("recording") : statusBadge.classList.remove("recording");
+            const showReselect = ["已就绪", "处理完成", "当前浏览器不支持合成功能"].includes(text);
+            reselectBtn.style.display = showReselect ? "inline-block" : "none";
+        };
+
+        const initRecorder = () => {
+            if (!window.VideoEncoder) return false;
+            muxer = new Mp4Muxer.Muxer({
+                target: new Mp4Muxer.ArrayBufferTarget(),
+                video: { codec: 'avc', width: cvs.width, height: cvs.height },
+                fastStart: 'in-memory', firstTimestampBehavior: 'offset'
+            });
+            encoder = new VideoEncoder({
+                output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+                error: (e) => console.error(e)
+            });
+            encoder.configure({
+                codec: 'avc1.4DE028', width: cvs.width, height: cvs.height,
+                bitrate: targetBitrate, framerate: fps
+            });
+            return true;
+        };
+
+        const startRecording = async () => {
+            if (!currentParser || !window.VideoDecoder) return;
+            if (vid.currentTime >= vid.duration) vid.currentTime = 0;
+            if (!initRecorder()) return;
+
+            vid.pause(); isRecording = true;
+            let recordingStartTime = (vid.currentTime < 0.1) ? 0 : vid.currentTime;
+            frameCount = 0; startRecBtn.disabled = true; stopRecBtn.disabled = false;
+            playPauseBtn.disabled = true; timeSlider.disabled = true;
+
+            updateStatus("正在合成...", true);
+            const config = currentParser.getConfig();
+            const samples = currentParser.getSamples();
+
+            let startIdx = 0;
+            if (recordingStartTime > 0) {
+                const startTimeUs = recordingStartTime * 1000000;
+                let lastKeyIdx = 0;
+                for (let i = 0; i < samples.length; i++) {
+                    if (samples[i].type === 'key') lastKeyIdx = i;
+                    if (samples[i].timestamp >= startTimeUs) { startIdx = lastKeyIdx; break; }
+                }
+            }
+
+            return new Promise(async (resolve) => {
+                const decoder = new VideoDecoder({
+                    output: async (frame) => {
+                        if (!isRecording) { frame.close(); return; }
+                        const timeSec = frame.timestamp / 1000000;
+                        if (timeSec >= recordingStartTime) {
+                            drawFrame(timeSec, frame);
+
+                            if (encoder && encoder.state === 'configured') {
+                                // Important: Encode from WebGL canvas
+                                const outFrame = new VideoFrame(cvs, {
+                                    timestamp: Math.round(frameCount * (1000000 / fps)),
+                                    duration: Math.round(1000000 / fps)
+                                });
+                                encoder.encode(outFrame);
+                                outFrame.close();
+                                frameCount++;
+
+                                if (frameCount % 10 === 0) {
+                                    statusText.textContent = `正在合成: ${(timeSec - recordingStartTime).toFixed(1)}s`;
+                                    timeSlider.value = (timeSec / vid.duration) * 1000;
+                                    timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
+                                }
+                            }
+                        }
+                        frame.close();
+                    },
+                    error: (e) => { console.error("Decoder Error:", e); isRecording = false; resolve(); }
+                });
+
+                decoder.configure({ codec: config.codec, codedWidth: config.width, codedHeight: config.height, description: config.avcC });
+
+                for (let i = startIdx; i < samples.length; i++) {
+                    if (!isRecording) break;
+                    const s = samples[i];
+                    decoder.decode(new EncodedVideoChunk({ type: s.type, timestamp: s.timestamp, duration: s.duration, data: s.data }));
+                    if (decoder.decodeQueueSize > 10) await new Promise(r => setTimeout(r, 5));
+                    if (encoder && encoder.encodeQueueSize > 20) await new Promise(r => setTimeout(r, 10));
+                }
+
+                if (isRecording) { await decoder.flush(); decoder.close(); await stopRecording(); }
+                else { decoder.close(); }
+                resolve();
+            });
+        };
+
+        const stopRecording = async () => {
+            isRecording = false; updateStatus("正在导出...");
+            if (encoder && encoder.state !== 'closed') { await encoder.flush(); encoder.close(); }
+            if (muxer) {
+                muxer.finalize();
+                const { buffer } = muxer.target;
+                let finalBlob = originalMediaDate ? new Blob([patchMp4Metadata(buffer, originalMediaDate)], { type: 'video/mp4' }) : new Blob([buffer], { type: 'video/mp4' });
+                const file = new File([finalBlob], `${vidName}_time.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
+                const url = URL.createObjectURL(file);
+                const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
+                setTimeout(() => { URL.revokeObjectURL(url); updateStatus("处理完成"); }, 1000);
+            }
+            startRecBtn.disabled = false; stopRecBtn.disabled = true;
+            playPauseBtn.disabled = false; timeSlider.disabled = false;
+        };
+
+        // --- Core WebGL Render Loop ---
+        const drawFrame = (forcedTime = null, sourceFrame = null) => {
+            const source = sourceFrame || vid;
+            if (!source || (!sourceFrame && source.readyState < 2)) return;
+
+            const currentTime = forcedTime !== null ? forcedTime : (sourceFrame ? sourceFrame.timestamp / 1000000 : vid.currentTime);
+
+            // 1. Sync dimensions & Text Canvas sizing
+            if (cvs.width !== cachedCanvasWidth || cvs.height !== cachedCanvasHeight) {
+                cachedCanvasWidth = cvs.width;
+                cachedCanvasHeight = cvs.height;
+                textCanvas.width = cvs.width;
+                textCanvas.height = cvs.height;
+                gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+
+                let fontSize = cvs.width / 40;
+                const fontStack = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+                textCtx.font = `400 ${fontSize}px ${fontStack}`;
+
+                const testString = "0000-00-00 00:00:00";
+                const initialWidth = textCtx.measureText(testString).width;
+                const targetWidthRatio = 0.285;
+                const targetWidth = cvs.width * targetWidthRatio;
+
+                if (initialWidth > 0 && initialWidth < targetWidth) {
+                    fontSize *= (targetWidth / initialWidth);
+                    textCtx.font = `400 ${fontSize}px ${fontStack}`;
+                }
+                cachedFontSize = fontSize;
+                textCtx.textBaseline = 'middle';
+                cachedTextWidth = textCtx.measureText(testString).width;
+
+                // Force texture update flag
+                lastRenderedTimeStr = "";
+            }
+
+            // 2. Prepare Strings
+            reusableDate.setTime(videoStartTime + currentTime * 1000);
+            const timeStr = formatDate(reusableDate);
+            let seiText = "";
+
+            if (parsedFrames && parsedFrames.length > 0) {
+                const frameIndex = Math.min(Math.floor(currentTime * fps), parsedFrames.length - 1);
+                const frame = parsedFrames[frameIndex];
+                if (frame && frame.sei) {
+                    const sei = frame.sei;
+                    const speed = Math.round((sei.vehicleSpeedMps || 0) * 3.6);
+                    let apState = "NONE";
+                    if (enumFields && enumFields.autopilotState) {
+                        apState = enumFields.autopilotState.valuesById[sei.autopilotState] || "NONE";
+                    }
+                    const brake = sei.brakeApplied ? "ON" : "OFF";
+                    const accel = Math.round(sei.acceleratorPedalPosition || 0);
+                    seiText = `${speed} km/h | AP: ${apState} | BRK: ${brake} | ACC: ${accel}%`;
+                }
+            }
+
+            // 3. Update Text Texture ONLY if strings changed (Diffing update)
+            if (timeStr !== lastRenderedTimeStr || seiText !== lastRenderedSeiStr) {
+                textCtx.clearRect(0, 0, textCanvas.width, textCanvas.height);
+
+                const pad = cachedFontSize * 0.5, bgH = cachedFontSize * 1.2;
+                const timeX = cvs.width - cachedTextWidth - pad, bgY = cvs.height - pad - bgH;
+
+                textCtx.fillStyle = 'rgba(0, 0, 0, 0.4)';
+                textCtx.fillRect(timeX - 5, bgY, cachedTextWidth + 10, bgH);
+                textCtx.fillStyle = '#d1d1d1';
+                textCtx.fillText(timeStr, timeX, bgY + bgH * 0.5);
+
+                if (seiText) {
+                    const seiWidth = textCtx.measureText(seiText).width;
+                    textCtx.fillStyle = 'rgba(0, 0, 0, 0.4)';
+                    textCtx.fillRect(pad - 5, bgY, seiWidth + 10, bgH);
+                    textCtx.fillStyle = '#d1d1d1';
+                    textCtx.fillText(seiText, pad, bgY + bgH * 0.5);
+                }
+
+                lastRenderedTimeStr = timeStr;
+                lastRenderedSeiStr = seiText;
+
+                // Upload to WebGL Text Texture
+                gl.activeTexture(gl.TEXTURE1);
+                gl.bindTexture(gl.TEXTURE_2D, textTexture);
+                gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // No flip here, managed by shader
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textCanvas);
+            }
+
+            // 4. Upload Video Frame to GPU
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+            // ZERO-COPY upload for VideoFrame
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+
+            // 5. Render WebGL Composite
+            gl.useProgram(program);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.enableVertexAttribArray(positionLoc);
+            gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+            gl.enableVertexAttribArray(texCoordLoc);
+            gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
+
+            gl.uniform1i(videoTexLoc, 0);
+            gl.uniform1i(textTexLoc, 1);
+
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+            if (!dragging && forcedTime === null) {
+                timeSlider.value = (vid.currentTime / vid.duration) * 1000;
+                timeDisplay.textContent = `${formatTime(vid.currentTime)} / ${formatTime(vid.duration)}`;
+            }
+        };
+
+        const render = () => {
+            if (!vid || isRecording) {
+                if (animationId) cancelAnimationFrame(animationId);
+                animationId = null; return;
+            }
+            if (animationId) cancelAnimationFrame(animationId);
+            drawFrame();
+            if (!vid.paused) animationId = requestAnimationFrame(render);
+            else animationId = null;
+        };
+
+        const handleFile = async (file) => {
+            if (!file) return;
+            const isVideo = file.type.startsWith('video/') || file.name.match(/\.(mp4|mov|m4v)$/i);
+            if (!isVideo) return;
+
+            if (vid) {
+                vid.pause();
+                if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
+            }
+
+            syncPlayButton(true);
+            fps = 36;
+            cachedCanvasWidth = -1; cachedCanvasHeight = -1;
+
+            videoViewer.style.display = "block"; dropZone.style.display = "none";
+            updateStatus("正在解析遥测数据...");
+
+            vidName = file.name.substring(0, file.name.lastIndexOf('.'));
+            originalFileLastModified = file.lastModified;
+
+            const dateMatch = file.name.match(/(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})/);
+            if (dateMatch) { videoStartTime = new Date(`${dateMatch[1].replace(/-/g, '/')} ${dateMatch[2].replace(/-/g, ':')}`).getTime(); }
+
+            try {
+                const buffer = await file.arrayBuffer();
+                const protobufData = await DashcamHelpers.initProtobuf();
+                enumFields = protobufData.enumFields;
+                currentParser = new DashcamMP4(buffer);
+                parsedFrames = currentParser.parseFrames(protobufData.SeiMetadata);
+
+                try {
+                    const config = currentParser.getConfig();
+                    if (config.durations && config.durations.length > 0) {
+                        const totalDurationMs = config.durations.reduce((a, b) => a + b, 0);
+                        if (totalDurationMs > 0) fps = Math.round(config.durations.length / (totalDurationMs / 1000));
+                        const samples = currentParser.getSamples();
+                        const totalVideoBytes = samples.reduce((sum, s) => sum + s.data.length, 0);
+                        const durationSec = totalDurationMs / 1000;
+                        const originalBitrate = Math.round((totalVideoBytes * 8) / durationSec);
+                        targetBitrate = Math.max(5000000, Math.min(Math.round(originalBitrate * 1.05), 8000000));
+                    }
+                } catch (e) { targetBitrate = 5000000; }
+
+                if (!dateMatch) {
+                    const firstSei = parsedFrames.find(f => f.sei)?.sei;
+                    const mp4CreationTime = currentParser.getCreationTime();
+                    if (firstSei && firstSei.frameSeqNo) {
+                        const seq = Number(firstSei.frameSeqNo);
+                        if (seq > 1000000000000) { videoStartTime = seq; updateStatus("检测到 SEI 毫秒时间戳..."); }
+                        else if (seq > 1000000000) { videoStartTime = seq * 1000; updateStatus("检测到 SEI 秒级时间戳..."); }
+                        else if (mp4CreationTime) { videoStartTime = mp4CreationTime; updateStatus("基于 MP4 头部校准时间..."); }
+                        else { videoStartTime = originalFileLastModified || Date.now(); }
+                    } else { videoStartTime = mp4CreationTime || originalFileLastModified || Date.now(); }
+                }
+                originalMediaDate = Math.floor(videoStartTime / 1000) + MP4_EPOCH_OFFSET;
+            } catch (e) {
+                console.error("解析遥测数据失败", e);
+                parsedFrames = [];
+                if (typeof videoStartTime === 'undefined' || !dateMatch) videoStartTime = originalFileLastModified || Date.now();
+            }
+
+            updateStatus("请点击播放完成加载...");
+            const nextVid = createFreshVideo();
+            let isReady = false; let wxBridgeHandler = null;
+
+            const onReady = () => {
+                if (isReady) return;
+                if (nextVid.readyState < 1 && !nextVid.videoWidth) return;
+                isReady = true;
+                if (wxBridgeHandler) { document.removeEventListener('WeixinJSBridgeReady', wxBridgeHandler); wxBridgeHandler = null; }
+
+                cvs.width = nextVid.videoWidth; cvs.height = nextVid.videoHeight;
+                cachedCanvasWidth = -1; cachedCanvasHeight = -1;
+
+                startRecBtn.disabled = !checkCapabilities();
+                updateStatus("已就绪");
+                nextVid.currentTime = 0.001;
+                render();
+            };
+
+            nextVid.onloadedmetadata = onReady; nextVid.onloadeddata = onReady;
+            nextVid.oncanplay = onReady; nextVid.oncanplaythrough = onReady; nextVid.ondurationchange = onReady;
+            nextVid.onprogress = () => { if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady(); };
+            nextVid.onplay = () => { syncPlayButton(false); onReady(); };
+            nextVid.onpause = () => syncPlayButton(true);
+            nextVid.onseeked = () => { onReady(); if (nextVid.paused) render(); };
+
+            currentVideoUrl = URL.createObjectURL(file);
+            nextVid.src = currentVideoUrl; vid = nextVid;
+            nextVid.load();
+
+            const tryActivate = (doLoad = false) => {
+                if (isReady) return;
+                try {
+                    if (doLoad) nextVid.load();
+                    const p = nextVid.play();
+                    if (p) p.then(() => { nextVid.pause(); onReady(); }).catch(() => { if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady(); });
+                } catch (e) { }
+            };
+
+            tryActivate();
+            if (typeof WeixinJSBridge !== 'undefined') { WeixinJSBridge.invoke('getNetworkType', {}, () => tryActivate(true)); }
+            wxBridgeHandler = () => tryActivate(true);
+            document.addEventListener('WeixinJSBridgeReady', wxBridgeHandler, { once: true });
+            fileInput.value = "";
+        };
+
+        fileInput.onchange = (e) => handleFile(e.target.files[0]);
+        dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add("active"); };
+        dropZone.ondragleave = () => dropZone.classList.remove("active");
+        dropZone.ondrop = (e) => { e.preventDefault(); handleFile(e.dataTransfer.files[0]); };
+
+        const togglePlay = () => { if (!vid || isRecording) return; vid.paused ? (vid.play(), render()) : vid.pause(); };
+        cvs.onclick = togglePlay; playPauseBtn.onclick = togglePlay;
+        startRecBtn.onclick = startRecording; stopRecBtn.onclick = stopRecording;
+        reselectBtn.onclick = () => fileInput.click();
+        timeSlider.oninput = () => dragging = true;
+        timeSlider.onchange = () => { vid.currentTime = (timeSlider.value / 1000) * vid.duration; dragging = false; render(); };
+
+        window.onload = () => { if (!checkCapabilities()) updateStatus('当前浏览器不支持合成功能'); };
+    </script>
+</body>
+
+</html>

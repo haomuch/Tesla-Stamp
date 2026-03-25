@@ -949,7 +949,7 @@
 
         // Offscreen Canvas for Text Rendering (The Atlas)
         const textCanvas = document.createElement('canvas');
-        const textCtx = textCanvas.getContext('2d', { willReadFrequently: false });
+        const textCtx = textCanvas.getContext('2d', { willReadFrequently: true });
         let lastRenderedTimeStr = "";
         let lastRenderedSeiStr = "";
 
@@ -1213,7 +1213,7 @@
                     }
                     const brake = sei.brakeApplied ? "ON" : "OFF";
                     const accel = Math.round(sei.acceleratorPedalPosition || 0);
-                    seiText = `${speed} km/h | AP: ${apState} | BRK: ${brake} | ACC: ${accel}%`;
+                    seiText = `${speed} km/h | AP:${apState} | Brake:${brake} | Accel:${accel}%`;
                 }
             }
 

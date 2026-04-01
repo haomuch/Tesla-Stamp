@@ -7,8 +7,8 @@
     <link rel="icon" href="icon.png" type="image/png">
     <meta name="mobile-web-app-capable" content="yes">
     <link rel="apple-touch-icon" href="icon.png">
-    <script src="mp4-muxer.min.js"></script>
-    <script src="protobuf.min.js"></script>
+    <script src="public/mp4-muxer.min.js"></script>
+    <script src="public/protobuf.min.js"></script>
     <script>
         /**
          * Tesla Dashcam MP4 Parser
@@ -267,7 +267,7 @@
                 syntax = "proto3";
                 message SeiMetadata {
                 uint32 version = 1;
-                enum Gear { GEAR_PARK = 0; GEAR_DRIVE = 1; GEAR_REVERSE = 2; GEAR_NEUTRAL = 3; }
+                enum Gear { PARK = 0; DRIVE = 1; REVERSE = 2; NEUTRAL = 3; }
                 Gear gear_state = 2;
                 uint64 frame_seq_no = 3;
                 float vehicle_speed_mps = 4;
@@ -288,11 +288,10 @@
 
                 const root = protobuf.parse(protoText).root;
                 SeiMetadata = root.lookupType('SeiMetadata');
+                // 仅保留 camelCase 键（protobuf.js 解码字段名为 camelCase）
                 enumFields = {
                     gearState: SeiMetadata.lookup('Gear'),
-                    autopilotState: SeiMetadata.lookup('AutopilotState'),
-                    gear_state: SeiMetadata.lookup('Gear'),
-                    autopilot_state: SeiMetadata.lookup('AutopilotState')
+                    autopilotState: SeiMetadata.lookup('AutopilotState')
                 };
                 return { SeiMetadata, enumFields };
             }
@@ -870,6 +869,7 @@
 
         if (!gl) {
             alert("您的浏览器不支持 WebGL 2.0，无法运行此渲染管线。");
+            throw new Error("WebGL 2.0 not supported");
         }
 
         // Shaders
@@ -916,6 +916,12 @@
         gl.attachShader(program, vertexShader);
         gl.attachShader(program, fragmentShader);
         gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            const info = gl.getProgramInfoLog(program);
+            console.error("WebGL program link error:", info);
+            alert("WebGL 着色器链接失败，请尝试更新浏览器。\n\n" + info);
+            throw new Error("WebGL program link failed: " + info);
+        }
 
         const positionLoc = gl.getAttribLocation(program, "a_position");
         const texCoordLoc = gl.getAttribLocation(program, "a_texCoord");
@@ -957,6 +963,7 @@
         let cachedCanvasHeight = -1;
         let cachedFontSize = 0;
         let cachedTextWidth = 0;
+        let cachedMiddleSlotWidths = [];
 
         // UI toggles
         const guideHeader = document.querySelector("#guideHeader");
@@ -1031,8 +1038,11 @@
                         const version = view.getUint8(offset + 8);
                         const dataOffset = offset + 12;
                         if (version === 0 && dataOffset + 8 <= end) {
-                            view.setUint32(dataOffset, Number(creationTime));
-                            view.setUint32(dataOffset + 4, Number(creationTime));
+                            // 若时间戳超出 uint32 范围（2036 年后），跳过写入以避免溢出截断
+                            if (bigCreationTime <= 0xFFFFFFFFn) {
+                                view.setUint32(dataOffset, Number(bigCreationTime));
+                                view.setUint32(dataOffset + 4, Number(bigCreationTime));
+                            }
                         } else if (version === 1 && dataOffset + 16 <= end) {
                             view.setBigUint64(dataOffset, bigCreationTime);
                             view.setBigUint64(dataOffset + 8, bigCreationTime);
@@ -1192,6 +1202,10 @@
                 textCtx.textBaseline = 'middle';
                 cachedTextWidth = textCtx.measureText(testString).width;
 
+                // 预计算中间各部分的固定槽位宽度
+                const slotSamples = ["AP:NONE", "Brake:OFF", "Accel:100%"];
+                cachedMiddleSlotWidths = slotSamples.map(s => textCtx.measureText(s).width);
+
                 // Force texture update flag
                 lastRenderedTimeStr = "";
             }
@@ -1222,20 +1236,88 @@
                 textCtx.clearRect(0, 0, textCanvas.width, textCanvas.height);
 
                 const pad = cachedFontSize * 0.5, bgH = cachedFontSize * 1.2;
-                const timeX = cvs.width - cachedTextWidth - pad, bgY = cvs.height - pad - bgH;
+                const bgY = cvs.height - pad - bgH;
 
-                textCtx.fillStyle = 'rgba(0, 0, 0, 0.4)';
-                textCtx.fillRect(timeX - 5, bgY, cachedTextWidth + 10, bgH);
+                // Reserve a fixed slot for speed to avoid shifting when digits change (支持 3 位速度)
+                const maxSpeedSample = "000 km/h";
+                const leftSlotWidth = textCtx.measureText(maxSpeedSample).width + pad;
+
+                // Right slot reserved for time (cachedTextWidth is measured from testString earlier)
+                const rightSlotWidth = cachedTextWidth + pad;
+
+                const innerLeft = pad;
+                const innerRight = cvs.width - pad;
+
+                const middleAreaX0 = innerLeft + leftSlotWidth;
+                const middleAreaX1 = innerRight - rightSlotWidth;
+                const middleAreaWidth = Math.max(0, middleAreaX1 - middleAreaX0);
+
+                // Parse SEI parts (速度为首项，其他项按 ' | ' 分隔)
+                let speedPart = "";
+                const middleParts = [];
+                if (seiText) {
+                    const parts = seiText.split(' | ').map(s => s.trim()).filter(Boolean);
+                    if (parts.length > 0) {
+                        speedPart = parts.shift();
+                        for (const p of parts) middleParts.push(p);
+                    }
+                }
+
+                // Draw unified semi-transparent background across whole watermark row
+                const bgLeft = innerLeft - 8;
+                const bgRight = innerRight + 8;
+                const bgW = Math.max(0, bgRight - bgLeft);
+                const radius = Math.max(4, Math.round(bgH * 0.25));
+
+                // rounded rect helper
+                function roundRect(ctx, x, y, w, h, r) {
+                    const min = Math.min(w, h) / 2;
+                    if (r > min) r = min;
+                    ctx.beginPath();
+                    ctx.moveTo(x + r, y);
+                    ctx.arcTo(x + w, y, x + w, y + h, r);
+                    ctx.arcTo(x + w, y + h, x, y + h, r);
+                    ctx.arcTo(x, y + h, x, y, r);
+                    ctx.arcTo(x, y, x + w, y, r);
+                    ctx.closePath();
+                }
+
+                textCtx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+                roundRect(textCtx, bgLeft, bgY, bgW, bgH, radius);
+                textCtx.fill();
+
+                // Draw speed (left slot)
+                if (speedPart) {
+                    const speedTextX = innerLeft + 5;
+                    textCtx.fillStyle = '#d1d1d1';
+                    textCtx.textAlign = 'left';
+                    textCtx.fillText(speedPart, speedTextX, bgY + bgH * 0.5);
+                }
+
+                // Draw middle parts left fixed
+                if (middleParts.length > 0) {
+                    let currentX = middleAreaX0 + cachedFontSize; // Start with some padding after speed slot
+                    const gap = cachedFontSize * 1.5; // 设定固定间距
+                    for (let i = 0; i < middleParts.length; i++) {
+                        const txt = middleParts[i];
+                        textCtx.fillStyle = '#d1d1d1';
+                        textCtx.textAlign = 'left';
+                        textCtx.fillText(txt, currentX, bgY + bgH * 0.5);
+                        // 使用预存的固定槽位宽度，防止状态变化导致右侧文字抖动
+                        const slotW = cachedMiddleSlotWidths[i] || textCtx.measureText(txt).width;
+                        currentX += slotW + gap;
+                    }
+                }
+
+                // Draw time (right)
+                const timeTextWidth = textCtx.measureText(timeStr).width;
+                const timeX = cvs.width - pad - timeTextWidth;
                 textCtx.fillStyle = '#d1d1d1';
+                textCtx.textAlign = 'left';
                 textCtx.fillText(timeStr, timeX, bgY + bgH * 0.5);
 
-                if (seiText) {
-                    const seiWidth = textCtx.measureText(seiText).width;
-                    textCtx.fillStyle = 'rgba(0, 0, 0, 0.4)';
-                    textCtx.fillRect(pad - 5, bgY, seiWidth + 10, bgH);
-                    textCtx.fillStyle = '#d1d1d1';
-                    textCtx.fillText(seiText, pad, bgY + bgH * 0.5);
-                }
+                // Reset textAlign for safety
+                textCtx.textAlign = 'left';
 
                 lastRenderedTimeStr = timeStr;
                 lastRenderedSeiStr = seiText;

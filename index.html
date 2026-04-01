@@ -301,7 +301,12 @@
     </script>
     <title>Tesla Dashcam Stamp</title>
     <style>
-        /* 样式部分保持不变 */
+        /* 样式部分 */
+        html {
+            overflow-x: hidden;
+            width: 100vw;
+        }
+
         :root {
             --tesla-red: #e82127;
             --bg-black: #050505;
@@ -331,6 +336,7 @@
             min-height: 100vh;
             align-items: center;
             overflow-x: hidden;
+            width: 100vw;
             background-image: radial-gradient(circle at 50% -20%, var(--accent-glow) 0%, transparent 50%),
                 radial-gradient(circle at 0% 100%, rgba(20, 20, 20, 0.5) 0%, transparent 40%);
         }

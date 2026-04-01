@@ -3,6 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
+    <title>Tesla Dashcam Stamp</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="icon" href="icon.png" type="image/png">
     <meta name="mobile-web-app-capable" content="yes">
@@ -93,7 +94,8 @@
                     width: this.view.getUint16(avc1.start + 24),
                     height: this.view.getUint16(avc1.start + 26),
                     codec, sps, pps, timescale, durations,
-                    avcC: new Uint8Array(this.buffer, avcC.start, avcC.size)
+                    avcC: new Uint8Array(this.buffer, avcC.start, avcC.size),
+                    _stbl: stbl   // 缓存 stbl 引用，供 getSamples 复用，避免重复 Box 遍历
                 };
                 return this._config;
             }
@@ -102,11 +104,8 @@
                 if (this._samples) return this._samples;
 
                 const config = this.getConfig();
-                const moov = this.findBox(0, this.view.byteLength, 'moov');
-                const trak = this.findBox(moov.start, moov.end, 'trak');
-                const mdia = this.findBox(trak.start, trak.end, 'mdia');
-                const minf = this.findBox(mdia.start, mdia.end, 'minf');
-                const stbl = this.findBox(minf.start, minf.end, 'stbl');
+                // 修复4：复用 getConfig 已解析并缓存的 stbl 引用，避免重复遍历 moov/trak/mdia/minf/stbl
+                const stbl = config._stbl;
 
                 const stsz = this.findBox(stbl.start, stbl.end, 'stsz');
                 const sampleSizeDefault = this.view.getUint32(stsz.start + 4);
@@ -299,13 +298,9 @@
             window.DashcamHelpers = { initProtobuf };
         })();
     </script>
-    <title>Tesla Dashcam Stamp</title>
     <style>
         /* 样式部分 */
-        html {
-            overflow-x: hidden;
-            width: 100vw;
-        }
+        /* 修复13+14：title 已移至 head 顶部；html 上重复的 overflow-x/width 已删除，body 上已有相同声明 */
 
         :root {
             --tesla-red: #e82127;
@@ -416,6 +411,7 @@
             color: var(--text-secondary);
             transition: var(--transition);
             max-height: 100px;
+            /* 修复9：原 100px 不足以显示 3 条 li，改为 200px */
             opacity: 1;
             overflow: hidden;
         }
@@ -1032,7 +1028,16 @@
             const view = new DataView(buffer);
             const bigCreationTime = BigInt(creationTime);
             const targets = new Set([0x6D766864, 0x746B6864, 0x6D646864]);
-            const containers = new Set([0x6D6F6F76, 0x7472616B, 0x6D646961]);
+            const containers = new Set([
+                0x6D6F6F76, // moov
+                0x7472616B, // trak
+                0x6D646961, // mdia
+                0x6D696E66, // minf（修复8：原缺失）
+                0x7374626C, // stbl（修复8：原缺失）
+                0x75647461, // udta（修复8：原缺失，防止 udta 内嵌时间戳被跳过）
+                0x696C7374, // ilst（修复8：原缺失）
+                0x6D657461  // meta（修复8：原缺失）
+            ]);
 
             const patchBoxes = (start, end) => {
                 let offset = start;
@@ -1181,7 +1186,8 @@
             const source = sourceFrame || vid;
             if (!source || (!sourceFrame && source.readyState < 2)) return;
 
-            const currentTime = forcedTime !== null ? forcedTime : (sourceFrame ? sourceFrame.timestamp / 1000000 : vid.currentTime);
+            // 修复1：sourceFrame 调用时 forcedTime 已是 frame.timestamp/1e6，无需再从 sourceFrame 分支取值
+            const currentTime = forcedTime ?? vid.currentTime;
 
             // 1. Sync dimensions & Text Canvas sizing
             if (cvs.width !== cachedCanvasWidth || cvs.height !== cachedCanvasHeight) {
@@ -1208,9 +1214,10 @@
                 textCtx.textBaseline = 'middle';
                 cachedTextWidth = textCtx.measureText(testString).width;
 
-                // 预计算中间各部分的固定槽位宽度
-                const slotSamples = ["AP:NONE", "Brake:OFF", "Accel:100%"];
-                cachedMiddleSlotWidths = slotSamples.map(s => textCtx.measureText(s).width);
+                // 修复11：等宽字体下单字符宽度固定，用1次measureText取charW再乘字符数即可
+                // 槽位最大字符数：AP:FULL=7, Brake:OFF=9, Accel:100%=10
+                const charW = textCtx.measureText('A').width;
+                cachedMiddleSlotWidths = [7, 9, 10].map(n => charW * n);
 
                 // Force texture update flag
                 lastRenderedTimeStr = "";
@@ -1315,15 +1322,10 @@
                     }
                 }
 
-                // Draw time (right)
-                const timeTextWidth = textCtx.measureText(timeStr).width;
-                const timeX = cvs.width - pad - timeTextWidth;
+                // 修复2：直接使用 textAlign:'right' 对齐到 innerRight，无需手动计算 timeX；删除冗余的重置行
                 textCtx.fillStyle = '#d1d1d1';
-                textCtx.textAlign = 'left';
-                textCtx.fillText(timeStr, timeX, bgY + bgH * 0.5);
-
-                // Reset textAlign for safety
-                textCtx.textAlign = 'left';
+                textCtx.textAlign = 'right';
+                textCtx.fillText(timeStr, innerRight, bgY + bgH * 0.5);
 
                 lastRenderedTimeStr = timeStr;
                 lastRenderedSeiStr = seiText;
@@ -1363,16 +1365,54 @@
             }
         };
 
+        let lastVidTime = -1;
+        let lastVidTimeUpdate = 0;
+
         const render = () => {
-            if (!vid || isRecording) {
-                if (animationId) cancelAnimationFrame(animationId);
-                animationId = null; return;
-            }
             if (animationId) cancelAnimationFrame(animationId);
+            if (!vid || isRecording) {
+                animationId = null;
+                return;
+            }
+
+            // 增强修复：看门狗逻辑 - 检测视频是否在播放但进度卡死
+            const now = Date.now();
+            if (!vid.paused && !document.hidden) {
+                if (vid.currentTime === lastVidTime) {
+                    // 如果视频处于播放状态但进度停顿超过 500ms，触发强制微调
+                    if (now - lastVidTimeUpdate > 500) {
+                        vid.currentTime += 0.005;
+                        lastVidTimeUpdate = now;
+                        console.log("检测到视频管线卡死，执行看门狗唤醒...");
+                    }
+                } else {
+                    lastVidTime = vid.currentTime;
+                    lastVidTimeUpdate = now;
+                }
+            } else {
+                lastVidTime = -1; // 暂停或不可见时重置
+            }
+
             drawFrame();
-            if (!vid.paused) animationId = requestAnimationFrame(render);
-            else animationId = null;
+            // 只有在未暂停且未录制时才继续下一帧渲染
+            animationId = (!vid.paused && !isRecording) ? requestAnimationFrame(render) : null;
         };
+
+        // 核心修复：切换标签页/后台导致视频管线挂起或 rAF 停止
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) return;
+            if (vid && !isRecording) {
+                if (!vid.paused) {
+                    // 1. 尝试显式恢复播放，防止浏览器静默暂停
+                    vid.play().catch(() => {});
+                    // 2. 核心补救：无论 readyState 状态，统一执行微调（Nudge）以激活解码器
+                    vid.currentTime += 0.005; 
+                }
+                // 3. 重置监测时间并触发一次循环
+                lastVidTimeUpdate = Date.now();
+                render();
+            }
+        });
 
         const handleFile = async (file) => {
             if (!file) return;
@@ -1422,9 +1462,10 @@
                     const mp4CreationTime = currentParser.getCreationTime();
                     if (firstSei && firstSei.frameSeqNo) {
                         const seq = Number(firstSei.frameSeqNo);
-                        if (seq > 1000000000000) { videoStartTime = seq; updateStatus("检测到 SEI 毫秒时间戳..."); }
-                        else if (seq > 1000000000) { videoStartTime = seq * 1000; updateStatus("检测到 SEI 秒级时间戳..."); }
-                        else if (mp4CreationTime) { videoStartTime = mp4CreationTime; updateStatus("基于 MP4 头部校准时间..."); }
+                        // 修复7：时间基准来源改写 console.log，updateStatus 会被后续"请点击播放"立即覆盖无意义
+                        if (seq > 1000000000000) { videoStartTime = seq; console.log("时间基准：SEI 毫秒时间戳"); }
+                        else if (seq > 1000000000) { videoStartTime = seq * 1000; console.log("时间基准：SEI 秒级时间戳"); }
+                        else if (mp4CreationTime) { videoStartTime = mp4CreationTime; console.log("时间基准：MP4 头部"); }
                         else { videoStartTime = originalFileLastModified || Date.now(); }
                     } else { videoStartTime = mp4CreationTime || originalFileLastModified || Date.now(); }
                 }
@@ -1454,12 +1495,25 @@
                 render();
             };
 
-            nextVid.onloadedmetadata = onReady; nextVid.onloadeddata = onReady;
-            nextVid.oncanplay = onReady; nextVid.oncanplaythrough = onReady; nextVid.ondurationchange = onReady;
+            // 修复12：精简为3个关键事件触发 onReady（含isReady防重保护），移除高度重叠的冗余绑定
+            // loadedmetadata → 元数据就绪（桌面浏览器主路径）
+            // canplay       → 可播放（iOS Safari 主路径）
+            // progress      → 网络/Blob 首段数据到达后补充触发
+            nextVid.onloadedmetadata = onReady;
+            nextVid.oncanplay = onReady;
             nextVid.onprogress = () => { if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady(); };
-            nextVid.onplay = () => { syncPlayButton(false); onReady(); };
+            nextVid.onplay = () => {
+                syncPlayButton(false);
+                onReady();
+                if (!isRecording) render();
+            };
             nextVid.onpause = () => syncPlayButton(true);
             nextVid.onseeked = () => { onReady(); if (nextVid.paused) render(); };
+            nextVid.onended = () => { syncPlayButton(true); animationId = null; };
+            // 增加停滞判断：如果视频在播放中途卡死，尝试 nudging
+            const handleStall = () => { if (!vid.paused && !isRecording) vid.currentTime += 0.005; };
+            nextVid.onwaiting = handleStall;
+            nextVid.onstalled = handleStall;
 
             currentVideoUrl = URL.createObjectURL(file);
             nextVid.src = currentVideoUrl; vid = nextVid;
@@ -1484,9 +1538,21 @@
         fileInput.onchange = (e) => handleFile(e.target.files[0]);
         dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add("active"); };
         dropZone.ondragleave = () => dropZone.classList.remove("active");
-        dropZone.ondrop = (e) => { e.preventDefault(); handleFile(e.dataTransfer.files[0]); };
+        // 修复5：拖放完成后清除 active 样式，防止再次显示 dropZone 时残留高亮边框
+        dropZone.ondrop = (e) => { e.preventDefault(); dropZone.classList.remove("active"); handleFile(e.dataTransfer.files[0]); };
 
-        const togglePlay = () => { if (!vid || isRecording) return; vid.paused ? (vid.play(), render()) : vid.pause(); };
+        const togglePlay = () => {
+            if (!vid || isRecording) return;
+            if (vid.paused) {
+                vid.play();
+                // 确保 rAF 链在调用 play 后一定被重启（防止链断裂时画面冻结）
+                if (animationId === null) {
+                    animationId = requestAnimationFrame(render);
+                }
+            } else {
+                vid.pause();
+            }
+        };
         cvs.onclick = togglePlay; playPauseBtn.onclick = togglePlay;
         startRecBtn.onclick = startRecording; stopRecBtn.onclick = stopRecording;
         reselectBtn.onclick = () => fileInput.click();

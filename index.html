@@ -1215,8 +1215,10 @@
                 const initialWidth = textCtx.measureText(testString).width;
                 const targetWidth = cvs.width * 0.285;
                
-                fontSize = fontSize * (targetWidth / initialWidth);
-                textCtx.font = `400 ${fontSize}px ${fontStack}`;
+                if (initialWidth > 0 && initialWidth < targetWidth) {
+                    fontSize *= (targetWidth / initialWidth);  // 按比例放大字体
+                    textCtx.font = `400 ${fontSize}px ${fontStack}`;  // 应用新字体大小
+                }
                 
                 cachedFontSize = fontSize;
                 textCtx.textBaseline = 'middle';

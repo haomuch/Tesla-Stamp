@@ -41,7 +41,7 @@
 
 本项目的核心逻辑完全由原生 JavaScript 实现，无需复杂的后端支撑：
 
-- **MP4 解析器**：手写 `DashcamMP4` 类，深度解析 MP4 Box 结构（mdat/moov/stbl等），提取隐藏在 SEI NAL 单元中的 Protobuf 数据。
+- **MP4 解析器**：集成 `DashcamMP4` 类，深度解析 MP4 Box 结构（mdat/moov/stbl等），提取隐藏在 SEI NAL 单元中的 Protobuf 数据。
 - **Protobuf 解码**：利用 `protobuf.js` 解析特斯拉定义的车辆状态协议，获取高频物理参数。
 - **混合渲染管线**：
   - `Canvas 2D` 负责高效率的水印文本布局。

@@ -53,7 +53,7 @@
 ## 📦 依赖项
 
 项目运行依赖以下库（已包含在 `public/` 目录下）：
-- [mp4-muxer](https://github.com/Vanilagy/mp4-muxer/blob/main/build/mp4-muxer.min.js) - 高性能 MP4 封装库。
+- [mp4-muxer](https://github.com/Vanilagy/mp4-muxer/) - 高性能 MP4 封装库。
 - [protobuf.js](https://github.com/protobufjs/protobuf.js) - Google Protobuf 解码/编码。
 
 ---

@@ -298,6 +298,7 @@
             window.DashcamHelpers = { initProtobuf };
         })();
     </script>
+    
     <style>
         /* 样式部分 */
         /* 修复13+14：title 已移至 head 顶部；html 上重复的 overflow-x/width 已删除，body 上已有相同声明 */
@@ -1212,18 +1213,14 @@
 
                 const testString = "0000-00-00 00:00:00";
                 const initialWidth = textCtx.measureText(testString).width;
-                const targetWidthRatio = 0.285;
-                const targetWidth = cvs.width * targetWidthRatio;
-
-                if (initialWidth > 0 && initialWidth < targetWidth) {
-                    fontSize *= (targetWidth / initialWidth);
-                    textCtx.font = `400 ${fontSize}px ${fontStack}`;
-                }
+                const targetWidth = cvs.width * 0.285;
+               
+                fontSize = fontSize * (targetWidth / initialWidth);
+                textCtx.font = `400 ${fontSize}px ${fontStack}`;
+                
                 cachedFontSize = fontSize;
                 textCtx.textBaseline = 'middle';
                 cachedTextWidth = textCtx.measureText(testString).width;
-
-
 
                 // Force texture update flag
                 lastRenderedTimeStr = "";

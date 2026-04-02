@@ -573,6 +573,7 @@
             backdrop-filter: blur(10px);
             border-radius: 20px;
             color: var(--text-secondary);
+            line-height: 1;
             font-weight: 500;
             border: 1px solid var(--glass-border);
         }
@@ -587,6 +588,9 @@
             cursor: pointer;
             transition: var(--transition);
             display: none;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
             backdrop-filter: blur(10px);
             -webkit-backdrop-filter: blur(10px);
             font-weight: 600;
@@ -606,7 +610,12 @@
             border-color: rgba(232, 33, 39, 0.2);
         }
 
+        .status-badge .dot {
+            display: none;
+        }
+
         .status-badge.recording .dot {
+            display: inline-block;
             width: 8px;
             height: 8px;
             background: var(--tesla-red);
@@ -1072,7 +1081,7 @@
             statusText.textContent = text;
             isRec ? statusBadge.classList.add("recording") : statusBadge.classList.remove("recording");
             const showReselect = ["已就绪", "处理完成", "当前浏览器不支持合成功能"].includes(text);
-            reselectBtn.style.display = showReselect ? "inline-block" : "none";
+            reselectBtn.style.display = showReselect ? "inline-flex" : "none";
         };
 
         const initRecorder = () => {

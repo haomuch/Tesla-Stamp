@@ -257,10 +257,10 @@
 
         (function () {
             let SeiMetadata = null;
-            let enumFields = null;
+            let cachedEnumFields = null;
 
             async function initProtobuf() {
-                if (SeiMetadata) return { SeiMetadata, enumFields };
+                if (SeiMetadata) return { SeiMetadata, enumFields: cachedEnumFields };
 
                 const protoText = `
                 syntax = "proto3";
@@ -288,11 +288,11 @@
                 const root = protobuf.parse(protoText).root;
                 SeiMetadata = root.lookupType('SeiMetadata');
                 // 仅保留 camelCase 键（protobuf.js 解码字段名为 camelCase）
-                enumFields = {
+                cachedEnumFields = {
                     gearState: SeiMetadata.lookup('Gear'),
                     autopilotState: SeiMetadata.lookup('AutopilotState')
                 };
-                return { SeiMetadata, enumFields };
+                return { SeiMetadata, enumFields: cachedEnumFields };
             }
 
             window.DashcamHelpers = { initProtobuf };
@@ -957,7 +957,7 @@
 
         // Offscreen Canvas for Text Rendering (The Atlas)
         const textCanvas = document.createElement('canvas');
-        const textCtx = textCanvas.getContext('2d', { willReadFrequently: true });
+        const textCtx = textCanvas.getContext('2d');
         let lastRenderedTimeStr = "";
         let lastRenderedSeiStr = "";
 
@@ -965,7 +965,6 @@
         let cachedCanvasHeight = -1;
         let cachedFontSize = 0;
         let cachedTextWidth = 0;
-        let cachedMiddleSlotWidths = [];
 
         // UI toggles
         const guideHeader = document.querySelector("#guideHeader");
@@ -1214,10 +1213,7 @@
                 textCtx.textBaseline = 'middle';
                 cachedTextWidth = textCtx.measureText(testString).width;
 
-                // 修复11：等宽字体下单字符宽度固定，用1次measureText取charW再乘字符数即可
-                // 槽位最大字符数：AP:FULL=7, Brake:OFF=9, Accel:100%=10
-                const charW = textCtx.measureText('A').width;
-                cachedMiddleSlotWidths = [7, 9, 10].map(n => charW * n);
+
 
                 // Force texture update flag
                 lastRenderedTimeStr = "";
@@ -1227,6 +1223,11 @@
             reusableDate.setTime(videoStartTime + currentTime * 1000);
             const timeStr = formatDate(reusableDate);
             let seiText = "";
+
+            let speedVal = "--";
+            let accelVal = "--";
+            let brakeText = "Brake:--";
+            let apText = "AP:----";
 
             if (parsedFrames && parsedFrames.length > 0) {
                 const frameIndex = Math.min(Math.floor(currentTime * fps), parsedFrames.length - 1);
@@ -1240,7 +1241,14 @@
                     }
                     const brake = sei.brakeApplied ? "ON" : "OFF";
                     const accel = Math.round(sei.acceleratorPedalPosition || 0);
-                    seiText = `${speed} km/h | AP:${apState} | Brake:${brake} | Accel:${accel}%`;
+
+                    speedVal = speed.toString();
+                    accelVal = accel.toString();
+                    brakeText = `Brake:${brake}`;
+                    apText = `AP:${apState}`;
+
+                    seiText = `${speedVal}|${accelVal}|${brakeText}|${apText}`;
+
                 }
             }
 
@@ -1251,30 +1259,8 @@
                 const pad = cachedFontSize * 0.5, bgH = cachedFontSize * 1.2;
                 const bgY = cvs.height - pad - bgH;
 
-                // Reserve a fixed slot for speed to avoid shifting when digits change (支持 3 位速度)
-                const maxSpeedSample = "000 km/h";
-                const leftSlotWidth = textCtx.measureText(maxSpeedSample).width + pad;
-
-                // Right slot reserved for time (cachedTextWidth is measured from testString earlier)
-                const rightSlotWidth = cachedTextWidth + pad;
-
                 const innerLeft = pad;
                 const innerRight = cvs.width - pad;
-
-                const middleAreaX0 = innerLeft + leftSlotWidth;
-                const middleAreaX1 = innerRight - rightSlotWidth;
-                const middleAreaWidth = Math.max(0, middleAreaX1 - middleAreaX0);
-
-                // Parse SEI parts (速度为首项，其他项按 ' | ' 分隔)
-                let speedPart = "";
-                const middleParts = [];
-                if (seiText) {
-                    const parts = seiText.split(' | ').map(s => s.trim()).filter(Boolean);
-                    if (parts.length > 0) {
-                        speedPart = parts.shift();
-                        for (const p of parts) middleParts.push(p);
-                    }
-                }
 
                 // Draw unified semi-transparent background across whole watermark row
                 const bgLeft = innerLeft - 8;
@@ -1299,33 +1285,57 @@
                 roundRect(textCtx, bgLeft, bgY, bgW, bgH, radius);
                 textCtx.fill();
 
-                // Draw speed (left slot)
-                if (speedPart) {
-                    const speedTextX = innerLeft + 5;
-                    textCtx.fillStyle = '#d1d1d1';
-                    textCtx.textAlign = 'left';
-                    textCtx.fillText(speedPart, speedTextX, bgY + bgH * 0.5);
-                }
-
-                // Draw middle parts left fixed
-                if (middleParts.length > 0) {
-                    let currentX = middleAreaX0 + cachedFontSize; // Start with some padding after speed slot
-                    const gap = cachedFontSize * 1.5; // 设定固定间距
-                    for (let i = 0; i < middleParts.length; i++) {
-                        const txt = middleParts[i];
-                        textCtx.fillStyle = '#d1d1d1';
-                        textCtx.textAlign = 'left';
-                        textCtx.fillText(txt, currentX, bgY + bgH * 0.5);
-                        // 使用预存的固定槽位宽度，防止状态变化导致右侧文字抖动
-                        const slotW = cachedMiddleSlotWidths[i] || textCtx.measureText(txt).width;
-                        currentX += slotW + gap;
-                    }
-                }
-
-                // 修复2：直接使用 textAlign:'right' 对齐到 innerRight，无需手动计算 timeX；删除冗余的重置行
                 textCtx.fillStyle = '#d1d1d1';
+                const centerY = bgY + bgH * 0.5;
+                const seiGap = cachedFontSize * 1.75;
+
+                // 1. Date/Time (Left aligned)
+                textCtx.textAlign = 'left';
+                textCtx.fillText(timeStr, innerLeft, centerY);
+
+                // --- Right-Aligned Cluster Logic ---
+                // Define fixed slot widths for each element
+                const apSlotW = textCtx.measureText("AP:AUTO").width;
+                const brakeSlotW = textCtx.measureText("Brake:OFF").width;
+                const accelLabel = "Accel:";
+                const accelUnit = "%";
+                const accelDigit2W = textCtx.measureText("00").width;
+                const accelValW = textCtx.measureText(accelVal).width;
+                const accelNumW = Math.max(accelDigit2W, accelValW);
+                const accelSlotW = textCtx.measureText(accelLabel).width + accelNumW + textCtx.measureText(accelUnit).width;
+                const digitSlotW = textCtx.measureText("000").width;
+                const unitStr = " km/h";
+                const unitW = textCtx.measureText(unitStr).width;
+                const speedSlotW = digitSlotW + unitW;
+
+                // Calculate fixed starting X positions for each column (Right to Left)
+                const apX = innerRight - apSlotW;
+                const brakeX = apX - seiGap - brakeSlotW;
+                const accelX = brakeX - seiGap - accelSlotW;
+                const speedX = accelX - seiGap - speedSlotW;
+
+                textCtx.textAlign = 'left';
+
+                // 2. AP Status
+                textCtx.fillText(apText, apX, centerY);
+
+                // 3. Brake Status (Left-anchored in its slot)
+                textCtx.fillText(brakeText, brakeX, centerY);
+
+                // 4. Accelerator Position
+                textCtx.textAlign = 'left';
+                textCtx.fillText(accelLabel, accelX, centerY);
+                const accelLabelW = textCtx.measureText(accelLabel).width;
+                textCtx.fillText(accelUnit, accelX + accelLabelW + accelNumW, centerY);
+                // Digits (Right-aligned inside the sub-slot)
                 textCtx.textAlign = 'right';
-                textCtx.fillText(timeStr, innerRight, bgY + bgH * 0.5);
+                textCtx.fillText(accelVal, accelX + accelLabelW + accelNumW, centerY);
+
+                // 5. Speed (Anchored Unit Logic)
+                textCtx.textAlign = 'left';
+                textCtx.fillText(unitStr, speedX + digitSlotW, centerY);
+                textCtx.textAlign = 'right';
+                textCtx.fillText(speedVal, speedX + digitSlotW, centerY);
 
                 lastRenderedTimeStr = timeStr;
                 lastRenderedSeiStr = seiText;
@@ -1404,9 +1414,9 @@
             if (vid && !isRecording) {
                 if (!vid.paused) {
                     // 1. 尝试显式恢复播放，防止浏览器静默暂停
-                    vid.play().catch(() => {});
+                    vid.play().catch(() => { });
                     // 2. 核心补救：无论 readyState 状态，统一执行微调（Nudge）以激活解码器
-                    vid.currentTime += 0.005; 
+                    vid.currentTime += 0.005;
                 }
                 // 3. 重置监测时间并触发一次循环
                 lastVidTimeUpdate = Date.now();
@@ -1419,6 +1429,10 @@
             const isVideo = file.type.startsWith('video/') || file.name.match(/\.(mp4|mov|m4v)$/i);
             if (!isVideo) return;
 
+            // --- 重置全局解析状态，防止旧视频干扰 ---
+            videoStartTime = 0;
+            parsedFrames = [];
+            currentParser = null;
             if (vid) {
                 vid.pause();
                 if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
@@ -1457,23 +1471,45 @@
                     }
                 } catch (e) { targetBitrate = 5000000; }
 
-                if (!dateMatch) {
-                    const firstSei = parsedFrames.find(f => f.sei)?.sei;
-                    const mp4CreationTime = currentParser.getCreationTime();
-                    if (firstSei && firstSei.frameSeqNo) {
-                        const seq = Number(firstSei.frameSeqNo);
-                        // 修复7：时间基准来源改写 console.log，updateStatus 会被后续"请点击播放"立即覆盖无意义
-                        if (seq > 1000000000000) { videoStartTime = seq; console.log("时间基准：SEI 毫秒时间戳"); }
-                        else if (seq > 1000000000) { videoStartTime = seq * 1000; console.log("时间基准：SEI 秒级时间戳"); }
-                        else if (mp4CreationTime) { videoStartTime = mp4CreationTime; console.log("时间基准：MP4 头部"); }
-                        else { videoStartTime = originalFileLastModified || Date.now(); }
-                    } else { videoStartTime = mp4CreationTime || originalFileLastModified || Date.now(); }
+                // --- 逻辑优化：重新平衡时间源优先级 ---
+                const firstSei = parsedFrames.find(f => f.sei)?.sei;
+                const mp4CreationTime = currentParser.getCreationTime();
+                let timeBaseSource = "fallback";
+
+                // 1. 优先尝试从 SEI 中提取最精准的各种时间戳
+                if (firstSei && firstSei.frameSeqNo) {
+                    const seq = Number(firstSei.frameSeqNo);
+                    if (seq > 1000000000000) {  // 毫秒级时间戳 (毫秒 > 2001年)
+                        videoStartTime = seq;
+                        timeBaseSource = "SEI 毫秒级时间戳";
+                    } else if (seq > 1000000000) { // 秒级时间戳
+                        videoStartTime = seq * 1000;
+                        timeBaseSource = "SEI 秒级时间戳";
+                    }
                 }
+
+                // 2. 如果 SEI 不含有效时间戳，则寻找文件名日期
+                if (!videoStartTime && dateMatch) {
+                    videoStartTime = new Date(`${dateMatch[1].replace(/-/g, '/')} ${dateMatch[2].replace(/-/g, ':')}`).getTime();
+                    timeBaseSource = "文件名日期";
+                }
+
+                // 3. 兜底方案：MP4 头部创建时间 -> 文件最后修改时间 -> 当前时间
+                if (!videoStartTime) {
+                    if (mp4CreationTime) {
+                        videoStartTime = mp4CreationTime;
+                        timeBaseSource = "MP4 头部创建时间";
+                    } else {
+                        videoStartTime = originalFileLastModified || Date.now();
+                        timeBaseSource = originalFileLastModified ? "文件最后修改时间" : "当前系统时间";
+                    }
+                }
+                console.log(`时间基准确定：${timeBaseSource} (${videoStartTime})`);
                 originalMediaDate = Math.floor(videoStartTime / 1000) + MP4_EPOCH_OFFSET;
             } catch (e) {
                 console.error("解析遥测数据失败", e);
                 parsedFrames = [];
-                if (typeof videoStartTime === 'undefined' || !dateMatch) videoStartTime = originalFileLastModified || Date.now();
+                if (!videoStartTime) videoStartTime = originalFileLastModified || Date.now();
             }
 
             updateStatus("请点击播放完成加载...");

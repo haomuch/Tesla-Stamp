@@ -8,8 +8,8 @@
     <link rel="icon" href="icon.png" type="image/png">
     <meta name="mobile-web-app-capable" content="yes">
     <link rel="apple-touch-icon" href="icon.png">
-    <script src="mp4-muxer.min.js"></script>
-    <script src="protobuf.min.js"></script>
+    <script src="public/mp4-muxer.min.js"></script>
+    <script src="public/protobuf.min.js"></script>
     <script>
         /**
          * Tesla Dashcam MP4 Parser
@@ -568,7 +568,8 @@
             align-items: center;
             gap: 8px;
             font-size: 12px;
-            padding: 6px 14px;
+            height: 26px;
+            padding: 0 14px;
             background: rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(10px);
             border-radius: 20px;
@@ -582,8 +583,9 @@
             background: rgba(232, 33, 39, 0.15);
             border: 1px solid rgba(232, 33, 39, 0.3);
             color: var(--tesla-red);
-            font-size: 11px;
-            padding: 6px 14px;
+            font-size: 12px;
+            height: 26px;
+            padding: 0 14px;
             border-radius: 20px;
             cursor: pointer;
             transition: var(--transition);

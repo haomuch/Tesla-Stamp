@@ -359,7 +359,7 @@
         }
 
         .app-header .subtitle {
-            font-size: 14px;
+            font-size: 16px;
             color: var(--text-secondary);
             margin-top: 8px;
             letter-spacing: 2px;
@@ -383,7 +383,7 @@
             -webkit-backdrop-filter: blur(20px);
             border: 1px solid var(--glass-border);
             border-radius: 16px;
-            padding: 12px;
+            padding: 6px 12px 6px 12px;
             transition: var(--transition);
             box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
         }
@@ -411,7 +411,6 @@
             color: var(--text-secondary);
             transition: var(--transition);
             max-height: 100px;
-            /* 修复9：原 100px 不足以显示 3 条 li，改为 200px */
             opacity: 1;
             overflow: hidden;
         }
@@ -1256,34 +1255,16 @@
             if (timeStr !== lastRenderedTimeStr || seiText !== lastRenderedSeiStr) {
                 textCtx.clearRect(0, 0, textCanvas.width, textCanvas.height);
 
-                const pad = cachedFontSize * 0.5, bgH = cachedFontSize * 1.2;
-                const bgY = cvs.height - pad - bgH;
+                const bgH = cachedFontSize * 2;
+                const bgY = cvs.height - bgH;
 
+                const pad = cachedFontSize * 0.5;
                 const innerLeft = pad;
                 const innerRight = cvs.width - pad;
 
-                // Draw unified semi-transparent background across whole watermark row
-                const bgLeft = innerLeft - 8;
-                const bgRight = innerRight + 8;
-                const bgW = Math.max(0, bgRight - bgLeft);
-                const radius = Math.max(4, Math.round(bgH * 0.25));
-
-                // rounded rect helper
-                function roundRect(ctx, x, y, w, h, r) {
-                    const min = Math.min(w, h) / 2;
-                    if (r > min) r = min;
-                    ctx.beginPath();
-                    ctx.moveTo(x + r, y);
-                    ctx.arcTo(x + w, y, x + w, y + h, r);
-                    ctx.arcTo(x + w, y + h, x, y + h, r);
-                    ctx.arcTo(x, y + h, x, y, r);
-                    ctx.arcTo(x, y, x + w, y, r);
-                    ctx.closePath();
-                }
-
-                textCtx.fillStyle = 'rgba(0, 0, 0, 0.45)';
-                roundRect(textCtx, bgLeft, bgY, bgW, bgH, radius);
-                textCtx.fill();
+                // Draw unified opaque dark grey background across whole bottom width
+                textCtx.fillStyle = '#1a1a1a';
+                textCtx.fillRect(0, bgY, cvs.width, bgH);
 
                 textCtx.fillStyle = '#d1d1d1';
                 const centerY = bgY + bgH * 0.5;

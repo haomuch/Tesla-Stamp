@@ -8,8 +8,20 @@
     <link rel="icon" href="icon.png" type="image/png">
     <meta name="mobile-web-app-capable" content="yes">
     <link rel="apple-touch-icon" href="icon.png">
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#050505">
     <script src="public/mp4-muxer.min.js"></script>
     <script src="public/protobuf.min.js"></script>
+    <script>
+        // 注册 Service Worker，实现永久离线运行
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('sw.js')
+                    .then(reg => console.log('Service Worker Registered'))
+                    .catch(e => console.log('Registration Failed', e));
+            });
+        }
+    </script>
     <script>
         /**
          * Tesla Dashcam MP4 Parser
@@ -298,7 +310,6 @@
             window.DashcamHelpers = { initProtobuf };
         })();
     </script>
-    
     <style>
         /* 样式部分 */
         /* 修复13+14：title 已移至 head 顶部；html 上重复的 overflow-x/width 已删除，body 上已有相同声明 */
@@ -1213,16 +1224,18 @@
 
                 const testString = "0000-00-00 00:00:00";
                 const initialWidth = textCtx.measureText(testString).width;
-                const targetWidth = cvs.width * 0.285;
-               
+                const targetWidthRatio = 0.285;
+                const targetWidth = cvs.width * targetWidthRatio;
+
                 if (initialWidth > 0 && initialWidth < targetWidth) {
-                    fontSize *= (targetWidth / initialWidth);  // 按比例放大字体
-                    textCtx.font = `400 ${fontSize}px ${fontStack}`;  // 应用新字体大小
+                    fontSize *= (targetWidth / initialWidth);
+                    textCtx.font = `400 ${fontSize}px ${fontStack}`;
                 }
-                
                 cachedFontSize = fontSize;
                 textCtx.textBaseline = 'middle';
                 cachedTextWidth = textCtx.measureText(testString).width;
+
+
 
                 // Force texture update flag
                 lastRenderedTimeStr = "";
@@ -1291,9 +1304,8 @@
                 const accelLabel = "Accel:";
                 const accelUnit = "%";
                 const accelDigit2W = textCtx.measureText("00").width;
-                const accelValW = textCtx.measureText(accelVal).width;
-                const accelNumW = Math.max(accelDigit2W, accelValW);
-                const accelSlotW = textCtx.measureText(accelLabel).width + accelNumW + textCtx.measureText(accelUnit).width;
+                // Use fixed 2-digit width for overall layout calculation to lock Accel: position
+                const accelSlotW = textCtx.measureText(accelLabel).width + accelDigit2W + textCtx.measureText(accelUnit).width;
                 const digitSlotW = textCtx.measureText("000").width;
                 const unitStr = " km/h";
                 const unitW = textCtx.measureText(unitStr).width;
@@ -1317,10 +1329,15 @@
                 textCtx.textAlign = 'left';
                 textCtx.fillText(accelLabel, accelX, centerY);
                 const accelLabelW = textCtx.measureText(accelLabel).width;
-                textCtx.fillText(accelUnit, accelX + accelLabelW + accelNumW, centerY);
-                // Digits (Right-aligned inside the sub-slot)
+                
+                // Dynamic offset for digits end point: pushes % right if > 2 digits
+                const accelValW = textCtx.measureText(accelVal).width;
+                const xDigitEnd = accelX + accelLabelW + Math.max(accelDigit2W, accelValW);
+                
+                textCtx.fillText(accelUnit, xDigitEnd, centerY);
+                // Digits (Right-aligned to the dynamic end point)
                 textCtx.textAlign = 'right';
-                textCtx.fillText(accelVal, accelX + accelLabelW + accelNumW, centerY);
+                textCtx.fillText(accelVal, xDigitEnd, centerY);
 
                 // 5. Speed (Anchored Unit Logic)
                 textCtx.textAlign = 'left';

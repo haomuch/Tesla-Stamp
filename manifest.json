@@ -1,0 +1,17 @@
+{
+  "name": "Tesla Dashcam Stamp",
+  "short_name": "Tesla Stamp",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#050505",
+  "theme_color": "#e82127",
+  "description": "特斯拉行车记录仪水印工具 - 本地离线版",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

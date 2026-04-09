@@ -1193,7 +1193,7 @@
                 muxer.finalize();
                 const { buffer } = muxer.target;
                 let finalBlob = originalMediaDate ? new Blob([patchMp4Metadata(buffer, originalMediaDate)], { type: 'video/mp4' }) : new Blob([buffer], { type: 'video/mp4' });
-                const file = new File([finalBlob], `${vidName}_time.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
+                const file = new File([finalBlob], `${vidName}_stamp.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
                 const url = URL.createObjectURL(file);
                 const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
                 setTimeout(() => { URL.revokeObjectURL(url); updateStatus("处理完成"); }, 1000);

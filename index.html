@@ -8,7 +8,6 @@
     <link rel="icon" href="icon.png" type="image/png">
     <meta name="mobile-web-app-capable" content="yes">
     <link rel="apple-touch-icon" href="icon.png">
-    <meta property="og:image" content="https://haomuch.github.io/Tesla-Stamp/icon.png" />
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#050505">
     <script src="public/mp4-muxer.min.js"></script>
@@ -34,6 +33,7 @@
                 this.view = new DataView(buffer);
                 this._config = null;
                 this._samples = null;
+                this.isHEVC = false;
             }
 
             findBox(start, end, name) {
@@ -67,57 +67,87 @@
                 if (this._config) return this._config;
 
                 const moov = this.findBox(0, this.view.byteLength, 'moov');
-                const trak = this.findBox(moov.start, moov.end, 'trak');
-                const mdia = this.findBox(trak.start, trak.end, 'mdia');
-                const minf = this.findBox(mdia.start, mdia.end, 'minf');
-                const stbl = this.findBox(minf.start, minf.end, 'stbl');
-                const stsd = this.findBox(stbl.start, stbl.end, 'stsd');
-                const avc1 = this.findBox(stsd.start + 8, stsd.end, 'avc1');
-                const avcC = this.findBox(avc1.start + 78, avc1.end, 'avcC');
+                let trakPos = moov.start;
 
-                const o = avcC.start;
-                const codec = `avc1.${this.hex(this.view.getUint8(o + 1))}${this.hex(this.view.getUint8(o + 2))}${this.hex(this.view.getUint8(o + 3))}`;
+                // 遍历所有 trak，直到找到包含视频 SampleEntry 的轨道
+                // 解决 iOS 导入时系统可能在首位插入非视频轨道的问题
+                while (trakPos < moov.end) {
+                    let trak;
+                    try {
+                        trak = this.findBox(trakPos, moov.end, 'trak');
+                    } catch (e) { break; }
 
-                let p = o + 6;
-                const spsLen = this.view.getUint16(p);
-                const sps = new Uint8Array(this.buffer.slice(p + 2, p + 2 + spsLen));
-                p += 2 + spsLen + 1;
-                const ppsLen = this.view.getUint16(p);
-                const pps = new Uint8Array(this.buffer.slice(p + 2, p + 2 + ppsLen));
+                    try {
+                        const mdia = this.findBox(trak.start, trak.end, 'mdia');
+                        const minf = this.findBox(mdia.start, mdia.end, 'minf');
+                        const stbl = this.findBox(minf.start, minf.end, 'stbl');
+                        const stsd = this.findBox(stbl.start, stbl.end, 'stsd');
+                        
+                        let videoBoxEntry = null, descriptionBoxName = "", type = "avc";
+                        for (const format of [
+                            { name: 'avc1', desc: 'avcC', type: 'avc' },
+                            { name: 'hvc1', desc: 'hvcC', type: 'hevc' },
+                            { name: 'hev1', desc: 'hvcC', type: 'hevc' }
+                        ]) {
+                            try {
+                                videoBoxEntry = this.findBox(stsd.start + 8, stsd.end, format.name);
+                                descriptionBoxName = format.desc;
+                                type = format.type;
+                                break;
+                            } catch (e) {}
+                        }
 
-                const mdhd = this.findBox(mdia.start, mdia.end, 'mdhd');
-                const mdhdVersion = this.view.getUint8(mdhd.start);
-                const timescale = mdhdVersion === 1
-                    ? this.view.getUint32(mdhd.start + 20)
-                    : this.view.getUint32(mdhd.start + 12);
+                        if (videoBoxEntry) {
+                            this.isHEVC = (type === 'hevc');
+                            const descriptionBox = this.findBox(videoBoxEntry.start + 78, videoBoxEntry.end, descriptionBoxName);
+                            let codec = "";
+                            if (type === 'avc') {
+                                const o = descriptionBox.start;
+                                codec = `avc1.${this.hex(this.view.getUint8(o + 1))}${this.hex(this.view.getUint8(o + 2))}${this.hex(this.view.getUint8(o + 3))}`;
+                            } else {
+                                codec = 'hvc1.1.6.L120.B0'; 
+                            }
 
-                const stts = this.findBox(stbl.start, stbl.end, 'stts');
-                const entryCount = this.view.getUint32(stts.start + 4);
-                const durations = [];
-                let pos = stts.start + 8;
-                for (let i = 0; i < entryCount; i++) {
-                    const count = this.view.getUint32(pos);
-                    const delta = this.view.getUint32(pos + 4);
-                    const ms = (delta / timescale) * 1000;
-                    for (let j = 0; j < count; j++) durations.push(ms);
-                    pos += 8;
+                            const mdhd = this.findBox(mdia.start, mdia.end, 'mdhd');
+                            const mdhdVersion = this.view.getUint8(mdhd.start);
+                            const timescale = mdhdVersion === 1
+                                ? this.view.getUint32(mdhd.start + 20)
+                                : this.view.getUint32(mdhd.start + 12);
+
+                            const stts = this.findBox(stbl.start, stbl.end, 'stts');
+                            const entryCount = this.view.getUint32(stts.start + 4);
+                            const durations = [];
+                            let pos = stts.start + 8;
+                            for (let i = 0; i < entryCount; i++) {
+                                const count = this.view.getUint32(pos);
+                                const delta = this.view.getUint32(pos + 4);
+                                const ms = (delta / timescale) * 1000;
+                                for (let j = 0; j < count; j++) durations.push(ms);
+                                pos += 8;
+                            }
+
+                            this._config = {
+                                width: this.view.getUint16(videoBoxEntry.start + 24),
+                                height: this.view.getUint16(videoBoxEntry.start + 26),
+                                codec, timescale, durations,
+                                description: new Uint8Array(this.buffer.slice(descriptionBox.start, descriptionBox.start + descriptionBox.size)),
+                                type, _stbl: stbl
+                            };
+                            return this._config;
+                        }
+                    } catch (e) {
+                         // 当前轨道不包含视频，尝试下一个 trak
+                    }
+                    trakPos = trak.end;
                 }
-
-                this._config = {
-                    width: this.view.getUint16(avc1.start + 24),
-                    height: this.view.getUint16(avc1.start + 26),
-                    codec, sps, pps, timescale, durations,
-                    avcC: new Uint8Array(this.buffer, avcC.start, avcC.size),
-                    _stbl: stbl   // 缓存 stbl 引用，供 getSamples 复用，避免重复 Box 遍历
-                };
-                return this._config;
+                throw new Error("不支持的视频格式（未在任何轨道中找到有效视频流）");
             }
 
             getSamples() {
                 if (this._samples) return this._samples;
 
                 const config = this.getConfig();
-                // 修复4：复用 getConfig 已解析并缓存的 stbl 引用，避免重复遍历 moov/trak/mdia/minf/stbl
+                // 复用 getConfig 已缓存的 stbl 引用，避免重复遍历
                 const stbl = config._stbl;
 
                 const stsz = this.findBox(stbl.start, stbl.end, 'stsz');
@@ -140,6 +170,21 @@
                     const entryCount = this.view.getUint32(co64.start + 4);
                     for (let i = 0; i < entryCount; i++) chunkOffsets.push(Number(this.view.getBigUint64(co64.start + 8 + i * 8)));
                 }
+
+                let ptsOffsets = null;
+                try {
+                    const ctts = this.findBox(stbl.start, stbl.end, 'ctts');
+                    const entryCount = this.view.getUint32(ctts.start + 4);
+                    ptsOffsets = new Int32Array(sampleCount);
+                    let pos = ctts.start + 8;
+                    let idx = 0;
+                    for (let i = 0; i < entryCount; i++) {
+                        const count = this.view.getUint32(pos);
+                        const offset = this.view.getInt32(pos + 4);
+                        for (let j = 0; j < count && idx < sampleCount; j++) ptsOffsets[idx++] = offset;
+                        pos += 8;
+                    }
+                } catch (e) {}
 
                 const stsc = this.findBox(stbl.start, stbl.end, 'stsc');
                 const stscEntries = this.view.getUint32(stsc.start + 4);
@@ -174,9 +219,10 @@
                         const size = sampleSizes[currentSample];
                         const durationMs = config.durations[currentSample] || (1000 / 36);
 
+                        const ptsOffsetUs = ptsOffsets ? (ptsOffsets[currentSample] / config.timescale) * 1000000 : 0;
                         samples.push({
-                            data: new Uint8Array(this.buffer, offset, size),
-                            timestamp: Math.round(currentTimeUs),
+                            data: new Uint8Array(this.buffer.slice(offset, offset + size)),
+                            timestamp: Math.round(currentTimeUs + ptsOffsetUs),
                             duration: Math.round(durationMs * 1000),
                             type: keyframes.has(currentSample) ? 'key' : 'delta'
                         });
@@ -200,13 +246,14 @@
                         : this.view.getUint32(mvhd.start + 4);
 
                     if (secondsSince1904 === 0) return null;
-                    return (secondsSince1904 - 2082844800) * 1000;
+                    return (secondsSince1904 - MP4_EPOCH_OFFSET) * 1000;
                 } catch (e) {
                     return null;
                 }
             }
 
             parseFrames(SeiMetadata) {
+                const config = this.getConfig(); // 确保 isHEVC 判定已执行
                 const mdat = this.findMdat();
                 const frames = [];
                 let cursor = mdat.offset;
@@ -218,12 +265,16 @@
                     cursor += 4;
                     if (len < 1 || cursor + len > this.view.byteLength) break;
 
-                    const type = this.view.getUint8(cursor) & 0x1F;
+                    const nalHeaderByte0 = this.view.getUint8(cursor);
+                    const type = this.isHEVC ? ((nalHeaderByte0 >> 1) & 0x3F) : (nalHeaderByte0 & 0x1F);
 
-                    if (type === 6) {
-                        const data = new Uint8Array(this.buffer.slice(cursor, cursor + len));
+                    if ((!this.isHEVC && type === 6) || (this.isHEVC && type === 39)) {
+                        // SEI NAL
+                        const headerLen = this.isHEVC ? 2 : 1;
+                        const data = new Uint8Array(this.buffer.slice(cursor + headerLen, cursor + len));
                         pendingSei = this.decodeSei(data, SeiMetadata);
-                    } else if (type === 5 || type === 1) {
+                    } else if ((!this.isHEVC && type >= 1 && type <= 5) || (this.isHEVC && type <= 31)) {
+                        // VCL Frame
                         frames.push({ sei: pendingSei });
                         pendingSei = null;
                     }
@@ -312,8 +363,6 @@
         })();
     </script>
     <style>
-        /* 样式部分 */
-        /* 修复13+14：title 已移至 head 顶部；html 上重复的 overflow-x/width 已删除，body 上已有相同声明 */
 
         :root {
             --tesla-red: #e82127;
@@ -875,6 +924,8 @@
         const MP4_EPOCH_OFFSET = 2082844800;
         let originalMediaDate = null;
         let originalFileLastModified = null;
+        // iOS 解码器对齐守卫：首次播放前强制 seek 确认，防止 iOS 从激活播放遭留的解码器缓存位置（而非 currentTime）开始播放
+        let firstPlayLock = false;
 
         const fileInput = document.querySelector("#fileInput");
         const dropZone = document.querySelector("#dropZone");
@@ -1054,11 +1105,9 @@
                 0x6D6F6F76, // moov
                 0x7472616B, // trak
                 0x6D646961, // mdia
-                0x6D696E66, // minf（修复8：原缺失）
-                0x7374626C, // stbl（修复8：原缺失）
-                0x75647461, // udta（修复8：原缺失，防止 udta 内嵌时间戳被跳过）
-                0x696C7374, // ilst（修复8：原缺失）
-                0x6D657461  // meta（修复8：原缺失）
+                0x6D696E66, // minf
+                0x75647461, // udta（防止内嵌时间戳被跳过）
+                0x6D657461  // meta
             ]);
 
             const patchBoxes = (start, end) => {
@@ -1099,11 +1148,28 @@
             reselectBtn.style.display = showReselect ? "inline-flex" : "none";
         };
 
-        const initRecorder = () => {
+        const initRecorder = async (isHEVC = false) => {
             if (!window.VideoEncoder) return false;
+
+            // 优先尝试与主源相同的编码，若不支持 HEVC 编码则回退到 AVC
+            let encoderCodec = isHEVC ? 'hvc1.1.6.L120.B0' : 'avc1.4DE028';
+            let muxerCodec = isHEVC ? 'hevc' : 'avc';
+
+            if (isHEVC) {
+                const support = await VideoEncoder.isConfigSupported({
+                    codec: encoderCodec, width: cvs.width, height: cvs.height,
+                    bitrate: targetBitrate, framerate: fps
+                });
+                if (!support.supported) {
+                    encoderCodec = 'avc1.4DE028';
+                    muxerCodec = 'avc';
+                    console.log("环境不支持 HEVC 编码，合成视频将降级使用 H.264 编码。");
+                }
+            }
+
             muxer = new Mp4Muxer.Muxer({
                 target: new Mp4Muxer.ArrayBufferTarget(),
-                video: { codec: 'avc', width: cvs.width, height: cvs.height },
+                video: { codec: muxerCodec, width: cvs.width, height: cvs.height },
                 fastStart: 'in-memory', firstTimestampBehavior: 'offset'
             });
             encoder = new VideoEncoder({
@@ -1111,80 +1177,118 @@
                 error: (e) => console.error(e)
             });
             encoder.configure({
-                codec: 'avc1.4DE028', width: cvs.width, height: cvs.height,
+                codec: encoderCodec, width: cvs.width, height: cvs.height,
                 bitrate: targetBitrate, framerate: fps
             });
             return true;
         };
 
         const startRecording = async () => {
-            if (!currentParser || !window.VideoDecoder) return;
-            if (vid.currentTime >= vid.duration) vid.currentTime = 0;
-            if (!initRecorder()) return;
+            try {
+                if (!currentParser || !window.VideoDecoder) return;
+                if (vid.currentTime >= vid.duration) vid.currentTime = 0;
 
-            vid.pause(); isRecording = true;
-            let recordingStartTime = (vid.currentTime < 0.1) ? 0 : vid.currentTime;
-            frameCount = 0; startRecBtn.disabled = true; stopRecBtn.disabled = false;
-            playPauseBtn.disabled = true; timeSlider.disabled = true;
+                const config = currentParser.getConfig();
+                if (!(await initRecorder(config.type === 'hevc'))) return;
 
-            updateStatus("正在合成...", true);
-            const config = currentParser.getConfig();
-            const samples = currentParser.getSamples();
+                vid.pause(); isRecording = true;
+                let recordingStartTime = (vid.currentTime < 0.1) ? 0 : vid.currentTime;
+                frameCount = 0; startRecBtn.disabled = true; stopRecBtn.disabled = false;
+                playPauseBtn.disabled = true; timeSlider.disabled = true;
 
-            let startIdx = 0;
-            if (recordingStartTime > 0) {
-                const startTimeUs = recordingStartTime * 1000000;
-                let lastKeyIdx = 0;
-                for (let i = 0; i < samples.length; i++) {
-                    if (samples[i].type === 'key') lastKeyIdx = i;
-                    if (samples[i].timestamp >= startTimeUs) { startIdx = lastKeyIdx; break; }
+                updateStatus("正在准备...", true);
+                const samples = currentParser.getSamples();
+                
+                // 帧率容错：如果检测到的 fps 不正常，强行纠正为特斯拉常用的 36fps
+                const activeFps = (fps > 10 && fps < 100) ? fps : 36;
+                const frameDurationUs = Math.round(1000000 / activeFps);
+
+                let startIdx = 0;
+                if (recordingStartTime > 0) {
+                    const startTimeUs = recordingStartTime * 1000000;
+                    let lastKeyIdx = 0;
+                    for (let i = 0; i < samples.length; i++) {
+                        if (samples[i].type === 'key') lastKeyIdx = i;
+                        if (samples[i].timestamp >= startTimeUs) { startIdx = lastKeyIdx; break; }
+                    }
                 }
-            }
+                updateStatus("正在合成...", true);
 
-            return new Promise(async (resolve) => {
-                const decoder = new VideoDecoder({
-                    output: async (frame) => {
-                        if (!isRecording) { frame.close(); return; }
-                        const timeSec = frame.timestamp / 1000000;
-                        if (timeSec >= recordingStartTime) {
-                            drawFrame(timeSec, frame);
+                let decodeLock = Promise.resolve();
 
-                            if (encoder && encoder.state === 'configured') {
-                                // Important: Encode from WebGL canvas
-                                const outFrame = new VideoFrame(cvs, {
-                                    timestamp: Math.round(frameCount * (1000000 / fps)),
-                                    duration: Math.round(1000000 / fps)
-                                });
-                                encoder.encode(outFrame);
-                                outFrame.close();
-                                frameCount++;
+                await new Promise(async (resolve, reject) => {
+                    const decoder = new VideoDecoder({
+                        output: (frame) => {
+                            decodeLock = decodeLock.then(async () => {
+                                if (!isRecording) { frame.close(); return; }
+                                try {
+                                    const timeSec = frame.timestamp / 1000000;
+                                    if (timeSec >= recordingStartTime) {
+                                        drawFrame(timeSec, frame);
 
-                                if (frameCount % 10 === 0) {
-                                    statusText.textContent = `正在合成: ${(timeSec - recordingStartTime).toFixed(1)}s`;
-                                    timeSlider.value = (timeSec / vid.duration) * 1000;
-                                    timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
+                                        if (encoder && encoder.state === 'configured') {
+                                            // 恢复稳定的时间戳算法，解决变速/慢动作问题
+                                            const pts = Math.round(frameCount * frameDurationUs);
+
+                                            const outFrame = new VideoFrame(cvs, {
+                                                timestamp: pts,
+                                                duration: frameDurationUs
+                                            });
+                                            encoder.encode(outFrame);
+                                            outFrame.close();
+                                            frameCount++;
+
+                                            if (frameCount % 10 === 0) {
+                                                statusText.textContent = `正在合成: ${(timeSec - recordingStartTime).toFixed(1)}s`;
+                                                timeSlider.value = (timeSec / vid.duration) * 1000;
+                                                timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
+                                            }
+                                        }
+                                    }
+                                } catch (e) {
+                                    reject(e);
+                                } finally {
+                                    frame.close();
                                 }
-                            }
-                        }
-                        frame.close();
-                    },
-                    error: (e) => { console.error("Decoder Error:", e); isRecording = false; resolve(); }
+                            });
+                        },
+                        error: (e) => reject(e)
+                    });
+
+                    decoder.configure({ 
+                        codec: config.codec, 
+                        codedWidth: config.width, 
+                        codedHeight: config.height, 
+                        description: config.description 
+                    });
+
+                    for (let i = startIdx; i < samples.length; i++) {
+                        if (!isRecording) break;
+                        const s = samples[i];
+                        decoder.decode(new EncodedVideoChunk({ type: s.type, timestamp: s.timestamp, duration: s.duration, data: s.data }));
+                        if (decoder.decodeQueueSize > 5) await new Promise(r => setTimeout(r, 5));
+                        if (encoder && encoder.encodeQueueSize > 10) await new Promise(r => setTimeout(r, 10));
+                    }
+
+                    if (isRecording) { 
+                        await decoder.flush(); 
+                        await decodeLock;
+                        decoder.close(); 
+                        await stopRecording(); 
+                    } else { 
+                        decoder.close(); 
+                    }
+                    resolve();
                 });
-
-                decoder.configure({ codec: config.codec, codedWidth: config.width, codedHeight: config.height, description: config.avcC });
-
-                for (let i = startIdx; i < samples.length; i++) {
-                    if (!isRecording) break;
-                    const s = samples[i];
-                    decoder.decode(new EncodedVideoChunk({ type: s.type, timestamp: s.timestamp, duration: s.duration, data: s.data }));
-                    if (decoder.decodeQueueSize > 10) await new Promise(r => setTimeout(r, 5));
-                    if (encoder && encoder.encodeQueueSize > 20) await new Promise(r => setTimeout(r, 10));
-                }
-
-                if (isRecording) { await decoder.flush(); decoder.close(); await stopRecording(); }
-                else { decoder.close(); }
-                resolve();
-            });
+            } catch (e) {
+                console.error("Synthesis error:", e);
+                updateStatus("合成出错: " + e.message);
+                isRecording = false;
+                startRecBtn.disabled = false;
+                stopRecBtn.disabled = true;
+                playPauseBtn.disabled = false;
+                timeSlider.disabled = false;
+            }
         };
 
         const stopRecording = async () => {
@@ -1208,7 +1312,6 @@
             const source = sourceFrame || vid;
             if (!source || (!sourceFrame && source.readyState < 2)) return;
 
-            // 修复1：sourceFrame 调用时 forcedTime 已是 frame.timestamp/1e6，无需再从 sourceFrame 分支取值
             const currentTime = forcedTime ?? vid.currentTime;
 
             // 1. Sync dimensions & Text Canvas sizing
@@ -1327,14 +1430,13 @@
                 textCtx.fillText(brakeText, brakeX, centerY);
 
                 // 4. Accelerator Position
-                textCtx.textAlign = 'left';
                 textCtx.fillText(accelLabel, accelX, centerY);
                 const accelLabelW = textCtx.measureText(accelLabel).width;
-                
+
                 // Dynamic offset for digits end point: pushes % right if > 2 digits
                 const accelValW = textCtx.measureText(accelVal).width;
                 const xDigitEnd = accelX + accelLabelW + Math.max(accelDigit2W, accelValW);
-                
+
                 textCtx.fillText(accelUnit, xDigitEnd, centerY);
                 // Digits (Right-aligned to the dynamic end point)
                 textCtx.textAlign = 'right';
@@ -1377,6 +1479,7 @@
             gl.uniform1i(textTexLoc, 1);
 
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            gl.finish(); // 关键修复：强制等待 GPU 绘图完成，消除 iOS 上的捕获拖尾
 
             if (!dragging && forcedTime === null) {
                 timeSlider.value = (vid.currentTime / vid.duration) * 1000;
@@ -1388,6 +1491,8 @@
         let lastVidTimeUpdate = 0;
 
         const render = () => {
+            // 外部直接调用 render() 时（如 onseeked、visibilitychange），取消旧的 rAF 调度以防双重排队
+            // 注意：在 rAF 回调内部调用时，此处的 cancelAnimationFrame 是无效操作（ID 已被消耗），但不影响流程
             if (animationId) cancelAnimationFrame(animationId);
             if (!vid || isRecording) {
                 animationId = null;
@@ -1442,6 +1547,7 @@
             videoStartTime = 0;
             parsedFrames = [];
             currentParser = null;
+            firstPlayLock = true; // 重置首次播放守卫，新视频需要解码器对齐
             if (vid) {
                 vid.pause();
                 if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
@@ -1458,7 +1564,6 @@
             originalFileLastModified = file.lastModified;
 
             const dateMatch = file.name.match(/(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})/);
-            if (dateMatch) { videoStartTime = new Date(`${dateMatch[1].replace(/-/g, '/')} ${dateMatch[2].replace(/-/g, ':')}`).getTime(); }
 
             try {
                 const buffer = await file.arrayBuffer();
@@ -1523,27 +1628,58 @@
 
             updateStatus("请点击播放完成加载...");
             const nextVid = createFreshVideo();
-            let isReady = false; let wxBridgeHandler = null;
+            let isReady = false; 
+            let dimensionsSet = false;
+            let wxBridgeHandler = null;
+            // 归位 seek 进行中标记：seek 完成前（onseeked 触发前），阻止任何并发事件提前将 isReady 置为 true
+            let isSeeking = false;
 
             const onReady = () => {
-                if (isReady) return;
                 if (nextVid.readyState < 1 && !nextVid.videoWidth) return;
-                isReady = true;
-                if (wxBridgeHandler) { document.removeEventListener('WeixinJSBridgeReady', wxBridgeHandler); wxBridgeHandler = null; }
+                
+                // 1. 同步视频尺寸（仅执行一次）
+                if (!dimensionsSet && nextVid.videoWidth) {
+                    cvs.width = nextVid.videoWidth; 
+                    cvs.height = nextVid.videoHeight;
+                    cachedCanvasWidth = -1; 
+                    cachedCanvasHeight = -1;
+                    dimensionsSet = true;
+                }
 
-                cvs.width = nextVid.videoWidth; cvs.height = nextVid.videoHeight;
-                cachedCanvasWidth = -1; cachedCanvasHeight = -1;
+                if (isReady) return;
+
+                // 2. 归位 seek 进行中（Guard D 触发后），必须等待 onseeked 确认到位才能继续
+                // 防止 oncanplay、onprogress、onpause 等并发事件在 seek 未完成时抢先 set isReady
+                if (isSeeking) return;
+
+                // 3. 核心逻辑：确保 iOS 自动激活后能够正确回到开头
+                // 如果视频正在进行 tryActivate 的激活播放，等待其暂停后再进行就绪判定
+                if (!nextVid.paused) return;
+
+                // 4. 针对 iOS 的自动播放导致的进度偏移进行强制回跳
+                // 如果当前进度明显偏离开头（如激活时播放了超过 0.1s），则强制归位到 0
+                if (nextVid.currentTime > 0.1) {
+                    nextVid.pause();    // 先暂停，消除 Guard C 的竞态
+                    isSeeking = true;   // 加锁：只有 onseeked 可以解锁，阻断其他并发事件
+                    nextVid.currentTime = 0; // seek 到 0，比 0.001 对 iOS keyframe snap 更健壮
+                    return; // 等待 onseeked 触发，届时 isSeeking=false 后再次进入 onReady
+                }
+
+                // 4. 到这里才认为初始化真正完成
+                isReady = true;
+                if (wxBridgeHandler) { 
+                    document.removeEventListener('WeixinJSBridgeReady', wxBridgeHandler); 
+                    wxBridgeHandler = null; 
+                }
 
                 startRecBtn.disabled = !checkCapabilities();
                 updateStatus("已就绪");
-                nextVid.currentTime = 0.001;
+                
+                // 5. 进行一次初始渲染，展示预览帧
                 render();
             };
 
-            // 修复12：精简为3个关键事件触发 onReady（含isReady防重保护），移除高度重叠的冗余绑定
-            // loadedmetadata → 元数据就绪（桌面浏览器主路径）
-            // canplay       → 可播放（iOS Safari 主路径）
-            // progress      → 网络/Blob 首段数据到达后补充触发
+            // 监听关键事件来触发就绪逻辑
             nextVid.onloadedmetadata = onReady;
             nextVid.oncanplay = onReady;
             nextVid.onprogress = () => { if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady(); };
@@ -1552,16 +1688,27 @@
                 onReady();
                 if (!isRecording) render();
             };
-            nextVid.onpause = () => syncPlayButton(true);
-            nextVid.onseeked = () => { onReady(); if (nextVid.paused) render(); };
+            nextVid.onpause = () => {
+                syncPlayButton(true);
+                onReady(); // 激活过程中的 pause 会触发此逻辑进行进度归位
+            };
+            nextVid.onseeked = () => {
+                // seek 完成：解锁 isSeeking，使 onReady 得以继续执行就绪判定
+                // 注意：isReady=true 之后用户拖动进度条触发的 onseeked 同样走此路径，isSeeking=false 是幂等操作
+                isSeeking = false;
+                onReady();
+                if (nextVid.paused) render();
+            };
             nextVid.onended = () => { syncPlayButton(true); animationId = null; };
-            // 增加停滞判断：如果视频在播放中途卡死，尝试 nudging
-            const handleStall = () => { if (!vid.paused && !isRecording) vid.currentTime += 0.005; };
+
+            // Nudge 逻辑：防止部分浏览器解码管线假死
+            const handleStall = () => { if (!nextVid.paused && !isRecording) nextVid.currentTime += 0.005; };
             nextVid.onwaiting = handleStall;
             nextVid.onstalled = handleStall;
 
             currentVideoUrl = URL.createObjectURL(file);
-            nextVid.src = currentVideoUrl; vid = nextVid;
+            nextVid.src = currentVideoUrl; 
+            vid = nextVid;
             nextVid.load();
 
             const tryActivate = (doLoad = false) => {
@@ -1569,12 +1716,23 @@
                 try {
                     if (doLoad) nextVid.load();
                     const p = nextVid.play();
-                    if (p) p.then(() => { nextVid.pause(); onReady(); }).catch(() => { if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady(); });
+                    if (p) {
+                        p.then(() => { 
+                            // 激活成功后立即暂停，这将触发 onpause -> onReady() -> 进度重置
+                            nextVid.pause(); 
+                        }).catch(() => {
+                            // 如果自动播放被拒绝，只要有基础数据也尝试标记就绪
+                            if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady();
+                        });
+                    }
                 } catch (e) { }
             };
 
             tryActivate();
-            if (typeof WeixinJSBridge !== 'undefined') { WeixinJSBridge.invoke('getNetworkType', {}, () => tryActivate(true)); }
+            if (typeof WeixinJSBridge !== 'undefined') { 
+                // 适配微信内环境
+                WeixinJSBridge.invoke('getNetworkType', {}, () => tryActivate(true)); 
+            }
             wxBridgeHandler = () => tryActivate(true);
             document.addEventListener('WeixinJSBridgeReady', wxBridgeHandler, { once: true });
             fileInput.value = "";
@@ -1583,16 +1741,37 @@
         fileInput.onchange = (e) => handleFile(e.target.files[0]);
         dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add("active"); };
         dropZone.ondragleave = () => dropZone.classList.remove("active");
-        // 修复5：拖放完成后清除 active 样式，防止再次显示 dropZone 时残留高亮边框
         dropZone.ondrop = (e) => { e.preventDefault(); dropZone.classList.remove("active"); handleFile(e.dataTransfer.files[0]); };
 
         const togglePlay = () => {
             if (!vid || isRecording) return;
             if (vid.paused) {
-                vid.play();
-                // 确保 rAF 链在调用 play 后一定被重启（防止链断裂时画面冻结）
-                if (animationId === null) {
-                    animationId = requestAnimationFrame(render);
+                const doPlay = () => {
+                    vid.play().catch(() => { syncPlayButton(true); });
+                    if (animationId === null) animationId = requestAnimationFrame(render);
+                };
+
+                // iOS 解码器对齐修复：首次在起始位置附近播放时，先强制 seek 到 0.001 并等待 onseeked，再调用 play()
+                // 原理：iOS 视频元素的“呼现位置”（currentTime=0）与内部“解码器位置”可能不同步；
+                // tryActivate 激活循环结束后，解码器可能仍缓存在激活播放的断点，
+                // 不经此对齐直接调用 play() 会导致 iOS 从解码器缓存位置而非 currentTime 开始播放。
+                // 使用 0.001 而非 0：初始化 seek 到了 0，再次 seek to 0 在 iOS 上会被视为 no-op 而不触发 onseeked；
+                // 而 0.001 是与 0 不同的位置，能必然触发 onseeked，从而强制解码器对齐。
+                if (firstPlayLock && vid.currentTime < 1.0) {
+                    firstPlayLock = false;
+                    let resolved = false;
+                    const resolvePlay = () => {
+                        if (resolved) return;
+                        resolved = true;
+                        vid.removeEventListener('seeked', resolvePlay);
+                        doPlay();
+                    };
+                    vid.addEventListener('seeked', resolvePlay, { once: true });
+                    vid.currentTime = 0.001; // 非零点 seek 必然触发 onseeked，强制 iOS 解码器对齐到起始帧
+                    // 兆底：极少数情况下 onseeked 不触发（如解码器重置异常），200ms 后强制播放
+                    setTimeout(resolvePlay, 200);
+                } else {
+                    doPlay();
                 }
             } else {
                 vid.pause();

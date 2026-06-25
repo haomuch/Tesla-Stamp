@@ -1065,7 +1065,7 @@
             return val || key;
         };
 
-        const applyLang = () => {
+        const applyLang = (skipTransition = false) => {
             document.getElementById('appSubtitle').textContent = t('subtitle');
             document.getElementById('guideTitleText').textContent = t('guideTitle');
             document.getElementById('guideStep1').textContent = t('guideStep1');
@@ -1080,13 +1080,13 @@
             document.getElementById('langOptZh').classList.toggle('active', currentLang === 'zh');
             document.getElementById('langOptEn').classList.toggle('active', currentLang === 'en');
             // Slide the indicator to the active option
-            updateLangIndicator();
+            updateLangIndicator(skipTransition);
             // Re-render current status text
             updateStatus(t(currentStatusKey, currentStatusArg), currentStatusIsRec);
         };
 
         // Moves the frosted-glass indicator pill to sit under the active option
-        const updateLangIndicator = () => {
+        const updateLangIndicator = (skipTransition = false) => {
             const indicator = document.getElementById('langIndicator');
             const activeBtn = currentLang === 'zh'
                 ? document.getElementById('langOptZh')
@@ -1096,8 +1096,20 @@
             // The indicator's CSS left:3px matches the container's 3px padding,
             // so translateX(0) aligns with the first button at offsetLeft=0.
             const tx = activeBtn.offsetLeft;
-            indicator.style.width = activeBtn.offsetWidth + 'px';
-            indicator.style.transform = `translateX(${tx}px)`;
+            
+            if (skipTransition) {
+                // Temporarily disable transition
+                const origTransition = indicator.style.transition;
+                indicator.style.transition = 'none';
+                indicator.style.width = activeBtn.offsetWidth + 'px';
+                indicator.style.transform = `translateX(${tx}px)`;
+                // Force a reflow to apply the styles without transition immediately
+                indicator.offsetHeight; 
+                indicator.style.transition = origTransition;
+            } else {
+                indicator.style.width = activeBtn.offsetWidth + 'px';
+                indicator.style.transform = `translateX(${tx}px)`;
+            }
         };
 
         const setLang = (lang) => {
@@ -1134,9 +1146,6 @@
         const langOptEn = document.querySelector("#langOptEn");
         langOptZh.onclick = () => setLang('zh');
         langOptEn.onclick = () => setLang('en');
-        // Sync initial active classes without transition (indicator positioned in window.onload)
-        langOptZh.classList.toggle('active', currentLang === 'zh');
-        langOptEn.classList.toggle('active', currentLang === 'en');
 
         // --- WebGL 2.0 Initialization ---
         const cvs = document.querySelector("#videoCanvas");
@@ -1348,6 +1357,9 @@
             const showReselect = reselectKeys.includes(currentStatusKey);
             reselectBtn.style.display = showReselect ? "inline-flex" : "none";
         };
+
+        // Synchronize language and UI elements immediately after functions are ready to prevent flashing
+        applyLang(true);
 
         const initRecorder = async (isHEVC = false) => {
             if (!window.VideoEncoder) return false;
@@ -1994,8 +2006,6 @@
         timeSlider.onchange = () => { vid.currentTime = (timeSlider.value / 1000) * vid.duration; dragging = false; render(); };
 
         window.onload = () => {
-            // Apply saved language on load
-            applyLang();
             if (!checkCapabilities()) {
                 currentStatusKey = 'statusNoSupport'; currentStatusArg = null; currentStatusIsRec = false;
                 updateStatus(t('statusNoSupport'));

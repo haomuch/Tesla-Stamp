@@ -29,8 +29,8 @@
          */
         class DashcamMP4 {
             constructor(buffer) {
-                this.buffer = buffer;
-                this.view = new DataView(buffer);
+                this.buffer = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+                this.view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
                 this._config = null;
                 this._samples = null;
                 this.isHEVC = false;
@@ -82,7 +82,7 @@
                         const minf = this.findBox(mdia.start, mdia.end, 'minf');
                         const stbl = this.findBox(minf.start, minf.end, 'stbl');
                         const stsd = this.findBox(stbl.start, stbl.end, 'stsd');
-                        
+
                         let videoBoxEntry = null, descriptionBoxName = "", type = "avc";
                         for (const format of [
                             { name: 'avc1', desc: 'avcC', type: 'avc' },
@@ -94,7 +94,7 @@
                                 descriptionBoxName = format.desc;
                                 type = format.type;
                                 break;
-                            } catch (e) {}
+                            } catch (e) { }
                         }
 
                         if (videoBoxEntry) {
@@ -105,7 +105,7 @@
                                 const o = descriptionBox.start;
                                 codec = `avc1.${this.hex(this.view.getUint8(o + 1))}${this.hex(this.view.getUint8(o + 2))}${this.hex(this.view.getUint8(o + 3))}`;
                             } else {
-                                codec = 'hvc1.1.6.L120.B0'; 
+                                codec = 'hvc1.1.6.L120.B0';
                             }
 
                             const mdhd = this.findBox(mdia.start, mdia.end, 'mdhd');
@@ -130,13 +130,13 @@
                                 width: this.view.getUint16(videoBoxEntry.start + 24),
                                 height: this.view.getUint16(videoBoxEntry.start + 26),
                                 codec, timescale, durations,
-                                description: new Uint8Array(this.buffer.slice(descriptionBox.start, descriptionBox.start + descriptionBox.size)),
+                                description: new Uint8Array(this.buffer.subarray(descriptionBox.start, descriptionBox.start + descriptionBox.size)),
                                 type, _stbl: stbl
                             };
                             return this._config;
                         }
                     } catch (e) {
-                         // 当前轨道不包含视频，尝试下一个 trak
+                        // 当前轨道不包含视频，尝试下一个 trak
                     }
                     trakPos = trak.end;
                 }
@@ -184,7 +184,7 @@
                         for (let j = 0; j < count && idx < sampleCount; j++) ptsOffsets[idx++] = offset;
                         pos += 8;
                     }
-                } catch (e) {}
+                } catch (e) { }
 
                 const stsc = this.findBox(stbl.start, stbl.end, 'stsc');
                 const stscEntries = this.view.getUint32(stsc.start + 4);
@@ -221,7 +221,7 @@
 
                         const ptsOffsetUs = ptsOffsets ? (ptsOffsets[currentSample] / config.timescale) * 1000000 : 0;
                         samples.push({
-                            data: new Uint8Array(this.buffer.slice(offset, offset + size)),
+                            data: new Uint8Array(this.buffer.subarray(offset, offset + size)),
                             timestamp: Math.round(currentTimeUs + ptsOffsetUs),
                             duration: Math.round(durationMs * 1000),
                             type: keyframes.has(currentSample) ? 'key' : 'delta'
@@ -271,7 +271,7 @@
                     if ((!this.isHEVC && type === 6) || (this.isHEVC && type === 39)) {
                         // SEI NAL
                         const headerLen = this.isHEVC ? 2 : 1;
-                        const data = new Uint8Array(this.buffer.slice(cursor + headerLen, cursor + len));
+                        const data = new Uint8Array(this.buffer.subarray(cursor + headerLen, cursor + len));
                         pendingSei = this.decodeSei(data, SeiMetadata);
                     } else if ((!this.isHEVC && type >= 1 && type <= 5) || (this.isHEVC && type <= 31)) {
                         // VCL Frame
@@ -363,7 +363,6 @@
         })();
     </script>
     <style>
-
         :root {
             --tesla-red: #e82127;
             --bg-black: #050505;
@@ -835,25 +834,95 @@
                 grid-template-columns: 1fr;
             }
         }
+
+        /* Language Segmented Toggle */
+        .lang-toggle-wrap {
+            width: 100%;
+            display: flex;
+            justify-content: center;
+            padding: 10px 0 15px;
+            position: relative;
+            z-index: 5;
+            margin-top: -10px;
+        }
+
+        .lang-switcher {
+            display: inline-flex;
+            align-items: center;
+            position: relative;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--glass-border);
+            border-radius: 22px;
+            padding: 3px;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+
+        /* The sliding frosted-glass pill indicator */
+        .lang-indicator {
+            position: absolute;
+            top: 3px;
+            left: 0;
+            height: calc(100% - 6px);
+            border-radius: 18px;
+            background: rgba(255, 255, 255, 0.13);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            box-shadow: 0 1px 10px rgba(0, 0, 0, 0.4),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.15);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            pointer-events: none;
+            transition: transform 0.38s cubic-bezier(0.16, 1, 0.3, 1),
+                        width 0.38s cubic-bezier(0.16, 1, 0.3, 1);
+            will-change: transform, width;
+        }
+
+        .lang-option {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 6px 18px;
+            border-radius: 18px;
+            font-size: 13px;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+            cursor: pointer;
+            color: var(--text-secondary);
+            border: none;
+            background: transparent;
+            transition: color 0.38s cubic-bezier(0.16, 1, 0.3, 1);
+            position: relative;
+            z-index: 1;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        .lang-option:hover {
+            color: rgba(255, 255, 255, 0.75);
+        }
+
+        .lang-option.active {
+            color: var(--text-primary);
+        }
     </style>
 </head>
 
 <body>
     <header class="app-header">
         <h1>Tesla Dashcam Stamp</h1>
-        <div class="subtitle">特斯拉行车记录仪水印工具</div>
+        <div class="subtitle" id="appSubtitle">特斯拉行车记录仪水印工具</div>
     </header>
 
     <main class="main-content">
         <section class="card guide-card">
             <div class="card-header" id="guideHeader">
-                <div class="card-title">使用说明</div>
+                <div class="card-title" id="guideTitleText">使用说明</div>
                 <div class="toggle-icon" id="toggleIcon">▼</div>
             </div>
             <ul class="guide-steps collapsed" id="guideSteps">
-                <li>导入原始视频文件，自动基于文件名添加水印</li>
-                <li>手机浏览器合成过程中，请勿切换到其他界面</li>
-                <li>所有文件都在客户端处理，不会上传到服务器</li>
+                <li id="guideStep1">导入原始视频文件，自动基于文件名添加水印</li>
+                <li id="guideStep2">手机浏览器合成过程中，请勿切换到其他界面</li>
+                <li id="guideStep3">所有文件都在客户端处理，不会上传到服务器</li>
             </ul>
         </section>
 
@@ -864,7 +933,7 @@
                         d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z" />
                 </svg>
             </div>
-            <p>选择原始视频文件</p>
+            <p id="uploadPrompt">选择原始视频文件</p>
             <input class="inputer" type="file" accept="video/*" id="fileInput" />
         </section>
 
@@ -878,7 +947,7 @@
                     <div style="display: flex; align-items: center; gap: 8px;">
                         <div class="status-badge" id="statusBadge">
                             <span class="dot"></span>
-                            <span class="text">等待导入视频...</span>
+                            <span class="text" id="statusText">等待导入视频...</span>
                         </div>
                         <button class="reselect-btn" id="reselectBtn">更换视频</button>
                     </div>
@@ -905,20 +974,143 @@
                                 d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z" />
                             <circle cx="12" cy="12" r="5" />
                         </svg>
-                        开始合成
+                        <span id="startRecBtnText">开始合成</span>
                     </button>
                     <button class="btn btn-secondary" id="stopRecBtn" disabled>
                         <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
                             <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
                         </svg>
-                        保存视频
+                        <span id="stopRecBtnText">保存视频</span>
                     </button>
                 </div>
             </div>
         </div>
     </main>
 
+    <!-- Language Segmented Toggle -->
+    <div class="lang-toggle-wrap">
+        <div class="lang-switcher" id="langSwitcher">
+            <div class="lang-indicator" id="langIndicator"></div>
+            <button class="lang-option active" id="langOptZh" data-lang="zh">中文</button>
+            <button class="lang-option" id="langOptEn" data-lang="en">English</button>
+        </div>
+    </div>
+
     <script>
+        // =============================================
+        // i18n: Internationalization System
+        // =============================================
+        const i18n = {
+            zh: {
+                subtitle: '特斯拉行车记录仪水印工具',
+                guideTitle: '使用说明',
+                guideStep1: '导入原始视频文件，自动基于文件名添加水印',
+                guideStep2: '手机浏览器合成过程中，请勿切换到其他界面',
+                guideStep3: '所有文件都在客户端处理，不会上传到服务器',
+                uploadPrompt: '选择原始视频文件',
+                statusWaiting: '等待导入视频...',
+                statusParsing: '正在解析遥测数据...',
+                statusClickPlay: '请点击播放完成加载...',
+                statusReady: '已就绪',
+                statusPreparing: '正在准备...',
+                statusSynthesizing: '正在合成...',
+                statusSynthesizingProgress: (t) => `正在合成: ${t}s`,
+                statusExporting: '正在导出...',
+                statusDone: '处理完成',
+                statusError: (msg) => `合成出错: ${msg}`,
+                statusNoSupport: '当前浏览器不支持合成功能',
+                reselectBtn: '更换视频',
+                startRecBtn: '开始合成',
+                stopRecBtn: '保存视频',
+                webglAlert: '您的浏览器不支持 WebGL 2.0，无法运行此渲染管线。',
+                shaderAlert: 'WebGL 着色器链接失败，请尝试更新浏览器。\n\n',
+            },
+            en: {
+                subtitle: 'Tesla Dashcam Watermark Tool',
+                guideTitle: 'How to Use',
+                guideStep1: 'Import raw video files to add SEI data.',
+                guideStep2: 'Do not switch apps/tabs while recording.',
+                guideStep3: 'All files are processed only on your device.',
+                uploadPrompt: 'Select Video File',
+                statusWaiting: 'Waiting for video...',
+                statusParsing: 'Parsing telemetry data...',
+                statusClickPlay: 'Tap play to finish loading...',
+                statusReady: 'Ready',
+                statusPreparing: 'Preparing...',
+                statusSynthesizing: 'Recording...',
+                statusSynthesizingProgress: (t) => `Recording: ${t}s`,
+                statusExporting: 'Exporting...',
+                statusDone: 'Done',
+                statusError: (msg) => `Recording error: ${msg}`,
+                statusNoSupport: 'This browser does not support recording',
+                reselectBtn: 'Change Video',
+                startRecBtn: 'Start Recording',
+                stopRecBtn: 'Stop & Save',
+                webglAlert: 'Your browser does not support WebGL 2.0. This rendering pipeline cannot run.',
+                shaderAlert: 'WebGL shader link failed. Please try updating your browser.\n\n',
+            }
+        };
+
+        // Load saved language preference, default to Chinese
+        let currentLang = localStorage.getItem('tesla_dashcam_lang') || 'zh';
+
+        // Status key tracking for dynamic re-translation
+        let currentStatusKey = 'statusWaiting';
+        let currentStatusArg = null;
+        let currentStatusIsRec = false;
+
+        const t = (key, arg) => {
+            const val = i18n[currentLang][key];
+            if (typeof val === 'function') return val(arg);
+            return val || key;
+        };
+
+        const applyLang = () => {
+            document.getElementById('appSubtitle').textContent = t('subtitle');
+            document.getElementById('guideTitleText').textContent = t('guideTitle');
+            document.getElementById('guideStep1').textContent = t('guideStep1');
+            document.getElementById('guideStep2').textContent = t('guideStep2');
+            document.getElementById('guideStep3').textContent = t('guideStep3');
+            document.getElementById('uploadPrompt').textContent = t('uploadPrompt');
+            document.getElementById('reselectBtn').textContent = t('reselectBtn');
+            document.getElementById('startRecBtnText').textContent = t('startRecBtn');
+            document.getElementById('stopRecBtnText').textContent = t('stopRecBtn');
+            document.getElementById('playPauseBtn').title = currentLang === 'zh' ? '播放/暂停' : 'Play/Pause';
+            // Update active text colour on options
+            document.getElementById('langOptZh').classList.toggle('active', currentLang === 'zh');
+            document.getElementById('langOptEn').classList.toggle('active', currentLang === 'en');
+            // Slide the indicator to the active option
+            updateLangIndicator();
+            // Re-render current status text
+            updateStatus(t(currentStatusKey, currentStatusArg), currentStatusIsRec);
+        };
+
+        // Moves the frosted-glass indicator pill to sit under the active option
+        const updateLangIndicator = () => {
+            const indicator = document.getElementById('langIndicator');
+            const activeBtn = currentLang === 'zh'
+                ? document.getElementById('langOptZh')
+                : document.getElementById('langOptEn');
+            if (!indicator || !activeBtn) return;
+            // offsetLeft is relative to .lang-switcher (position:relative parent)
+            // The indicator's CSS left:3px matches the container's 3px padding,
+            // so translateX(0) aligns with the first button at offsetLeft=0.
+            const tx = activeBtn.offsetLeft;
+            indicator.style.width = activeBtn.offsetWidth + 'px';
+            indicator.style.transform = `translateX(${tx}px)`;
+        };
+
+        const setLang = (lang) => {
+            if (lang === currentLang) return;
+            currentLang = lang;
+            localStorage.setItem('tesla_dashcam_lang', currentLang);
+            applyLang();
+        };
+
+        // =============================================
+        // End of i18n
+        // =============================================
+
         let fps = 36;
         let targetBitrate = 6000000;
         const MP4_EPOCH_OFFSET = 2082844800;
@@ -934,17 +1126,24 @@
         const statusBadge = document.querySelector("#statusBadge");
         const reselectBtn = document.querySelector("#reselectBtn");
         const playPauseBtn = document.querySelector("#playPauseBtn");
-        const statusText = statusBadge.querySelector(".text");
+        const statusText = document.querySelector("#statusText");
         const timeDisplay = document.querySelector("#timeDisplay");
         const videoViewer = document.querySelector("#videoViewer");
         const timeSlider = document.querySelector("#timeSlider");
+        const langOptZh = document.querySelector("#langOptZh");
+        const langOptEn = document.querySelector("#langOptEn");
+        langOptZh.onclick = () => setLang('zh');
+        langOptEn.onclick = () => setLang('en');
+        // Sync initial active classes without transition (indicator positioned in window.onload)
+        langOptZh.classList.toggle('active', currentLang === 'zh');
+        langOptEn.classList.toggle('active', currentLang === 'en');
 
         // --- WebGL 2.0 Initialization ---
         const cvs = document.querySelector("#videoCanvas");
         const gl = cvs.getContext('webgl2', { alpha: false, antialias: false, depth: false });
 
         if (!gl) {
-            alert("您的浏览器不支持 WebGL 2.0，无法运行此渲染管线。");
+            alert(t('webglAlert'));
             throw new Error("WebGL 2.0 not supported");
         }
 
@@ -995,7 +1194,7 @@
         if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
             const info = gl.getProgramInfoLog(program);
             console.error("WebGL program link error:", info);
-            alert("WebGL 着色器链接失败，请尝试更新浏览器。\n\n" + info);
+            alert(t('shaderAlert') + info);
             throw new Error("WebGL program link failed: " + info);
         }
 
@@ -1144,7 +1343,9 @@
         const updateStatus = (text, isRec = false) => {
             statusText.textContent = text;
             isRec ? statusBadge.classList.add("recording") : statusBadge.classList.remove("recording");
-            const showReselect = ["已就绪", "处理完成", "当前浏览器不支持合成功能"].includes(text);
+            // Show reselect button when in a terminal/idle state
+            const reselectKeys = ['statusReady', 'statusDone', 'statusNoSupport'];
+            const showReselect = reselectKeys.includes(currentStatusKey);
             reselectBtn.style.display = showReselect ? "inline-flex" : "none";
         };
 
@@ -1196,9 +1397,10 @@
                 frameCount = 0; startRecBtn.disabled = true; stopRecBtn.disabled = false;
                 playPauseBtn.disabled = true; timeSlider.disabled = true;
 
-                updateStatus("正在准备...", true);
+                currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
+                updateStatus(t('statusPreparing'), true);
                 const samples = currentParser.getSamples();
-                
+
                 // 帧率容错：如果检测到的 fps 不正常，强行纠正为特斯拉常用的 36fps
                 const activeFps = (fps > 10 && fps < 100) ? fps : 36;
                 const frameDurationUs = Math.round(1000000 / activeFps);
@@ -1212,7 +1414,8 @@
                         if (samples[i].timestamp >= startTimeUs) { startIdx = lastKeyIdx; break; }
                     }
                 }
-                updateStatus("正在合成...", true);
+                currentStatusKey = 'statusSynthesizing'; currentStatusArg = null; currentStatusIsRec = true;
+                updateStatus(t('statusSynthesizing'), true);
 
                 let decodeLock = Promise.resolve();
 
@@ -1239,7 +1442,8 @@
                                             frameCount++;
 
                                             if (frameCount % 10 === 0) {
-                                                statusText.textContent = `正在合成: ${(timeSec - recordingStartTime).toFixed(1)}s`;
+                                                currentStatusKey = 'statusSynthesizingProgress'; currentStatusArg = (timeSec - recordingStartTime).toFixed(1); currentStatusIsRec = true;
+                                                statusText.textContent = t('statusSynthesizingProgress', (timeSec - recordingStartTime).toFixed(1));
                                                 timeSlider.value = (timeSec / vid.duration) * 1000;
                                                 timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
                                             }
@@ -1255,11 +1459,11 @@
                         error: (e) => reject(e)
                     });
 
-                    decoder.configure({ 
-                        codec: config.codec, 
-                        codedWidth: config.width, 
-                        codedHeight: config.height, 
-                        description: config.description 
+                    decoder.configure({
+                        codec: config.codec,
+                        codedWidth: config.width,
+                        codedHeight: config.height,
+                        description: config.description
                     });
 
                     for (let i = startIdx; i < samples.length; i++) {
@@ -1270,19 +1474,20 @@
                         if (encoder && encoder.encodeQueueSize > 10) await new Promise(r => setTimeout(r, 10));
                     }
 
-                    if (isRecording) { 
-                        await decoder.flush(); 
+                    if (isRecording) {
+                        await decoder.flush();
                         await decodeLock;
-                        decoder.close(); 
-                        await stopRecording(); 
-                    } else { 
-                        decoder.close(); 
+                        decoder.close();
+                        await stopRecording();
+                    } else {
+                        decoder.close();
                     }
                     resolve();
                 });
             } catch (e) {
                 console.error("Synthesis error:", e);
-                updateStatus("合成出错: " + e.message);
+                currentStatusKey = 'statusError'; currentStatusArg = e.message; currentStatusIsRec = false;
+                updateStatus(t('statusError', e.message));
                 isRecording = false;
                 startRecBtn.disabled = false;
                 stopRecBtn.disabled = true;
@@ -1292,7 +1497,9 @@
         };
 
         const stopRecording = async () => {
-            isRecording = false; updateStatus("正在导出...");
+            isRecording = false;
+            currentStatusKey = 'statusExporting'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusExporting'));
             if (encoder && encoder.state !== 'closed') { await encoder.flush(); encoder.close(); }
             if (muxer) {
                 muxer.finalize();
@@ -1301,7 +1508,7 @@
                 const file = new File([finalBlob], `${vidName}_stamp.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
                 const url = URL.createObjectURL(file);
                 const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
-                setTimeout(() => { URL.revokeObjectURL(url); updateStatus("处理完成"); }, 1000);
+                setTimeout(() => { URL.revokeObjectURL(url); currentStatusKey = 'statusDone'; currentStatusArg = null; currentStatusIsRec = false; updateStatus(t('statusDone')); }, 1000);
             }
             startRecBtn.disabled = false; stopRecBtn.disabled = true;
             playPauseBtn.disabled = false; timeSlider.disabled = false;
@@ -1558,7 +1765,8 @@
             cachedCanvasWidth = -1; cachedCanvasHeight = -1;
 
             videoViewer.style.display = "block"; dropZone.style.display = "none";
-            updateStatus("正在解析遥测数据...");
+            currentStatusKey = 'statusParsing'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusParsing'));
 
             vidName = file.name.substring(0, file.name.lastIndexOf('.'));
             originalFileLastModified = file.lastModified;
@@ -1626,9 +1834,10 @@
                 if (!videoStartTime) videoStartTime = originalFileLastModified || Date.now();
             }
 
-            updateStatus("请点击播放完成加载...");
+            currentStatusKey = 'statusClickPlay'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusClickPlay'));
             const nextVid = createFreshVideo();
-            let isReady = false; 
+            let isReady = false;
             let dimensionsSet = false;
             let wxBridgeHandler = null;
             // 归位 seek 进行中标记：seek 完成前（onseeked 触发前），阻止任何并发事件提前将 isReady 置为 true
@@ -1636,12 +1845,12 @@
 
             const onReady = () => {
                 if (nextVid.readyState < 1 && !nextVid.videoWidth) return;
-                
+
                 // 1. 同步视频尺寸（仅执行一次）
                 if (!dimensionsSet && nextVid.videoWidth) {
-                    cvs.width = nextVid.videoWidth; 
+                    cvs.width = nextVid.videoWidth;
                     cvs.height = nextVid.videoHeight;
-                    cachedCanvasWidth = -1; 
+                    cachedCanvasWidth = -1;
                     cachedCanvasHeight = -1;
                     dimensionsSet = true;
                 }
@@ -1667,14 +1876,15 @@
 
                 // 4. 到这里才认为初始化真正完成
                 isReady = true;
-                if (wxBridgeHandler) { 
-                    document.removeEventListener('WeixinJSBridgeReady', wxBridgeHandler); 
-                    wxBridgeHandler = null; 
+                if (wxBridgeHandler) {
+                    document.removeEventListener('WeixinJSBridgeReady', wxBridgeHandler);
+                    wxBridgeHandler = null;
                 }
 
                 startRecBtn.disabled = !checkCapabilities();
-                updateStatus("已就绪");
-                
+                currentStatusKey = 'statusReady'; currentStatusArg = null; currentStatusIsRec = false;
+                updateStatus(t('statusReady'));
+
                 // 5. 进行一次初始渲染，展示预览帧
                 render();
             };
@@ -1707,7 +1917,7 @@
             nextVid.onstalled = handleStall;
 
             currentVideoUrl = URL.createObjectURL(file);
-            nextVid.src = currentVideoUrl; 
+            nextVid.src = currentVideoUrl;
             vid = nextVid;
             nextVid.load();
 
@@ -1717,9 +1927,9 @@
                     if (doLoad) nextVid.load();
                     const p = nextVid.play();
                     if (p) {
-                        p.then(() => { 
+                        p.then(() => {
                             // 激活成功后立即暂停，这将触发 onpause -> onReady() -> 进度重置
-                            nextVid.pause(); 
+                            nextVid.pause();
                         }).catch(() => {
                             // 如果自动播放被拒绝，只要有基础数据也尝试标记就绪
                             if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady();
@@ -1729,9 +1939,9 @@
             };
 
             tryActivate();
-            if (typeof WeixinJSBridge !== 'undefined') { 
+            if (typeof WeixinJSBridge !== 'undefined') {
                 // 适配微信内环境
-                WeixinJSBridge.invoke('getNetworkType', {}, () => tryActivate(true)); 
+                WeixinJSBridge.invoke('getNetworkType', {}, () => tryActivate(true));
             }
             wxBridgeHandler = () => tryActivate(true);
             document.addEventListener('WeixinJSBridgeReady', wxBridgeHandler, { once: true });
@@ -1783,7 +1993,14 @@
         timeSlider.oninput = () => dragging = true;
         timeSlider.onchange = () => { vid.currentTime = (timeSlider.value / 1000) * vid.duration; dragging = false; render(); };
 
-        window.onload = () => { if (!checkCapabilities()) updateStatus('当前浏览器不支持合成功能'); };
+        window.onload = () => {
+            // Apply saved language on load
+            applyLang();
+            if (!checkCapabilities()) {
+                currentStatusKey = 'statusNoSupport'; currentStatusArg = null; currentStatusIsRec = false;
+                updateStatus(t('statusNoSupport'));
+            }
+        };
     </script>
 </body>
 

@@ -1,17 +1,17 @@
 {
   "name": "Tesla Dashcam Stamp",
-  "short_name": "Tesla Stamp",
+  "short_name": "Tesla Dashcam",
+  "description": "解析Tesla行车记录仪MP4文件并提取SEI元数据的工具",
   "start_url": "./index.html",
   "display": "standalone",
   "background_color": "#050505",
-  "theme_color": "#e82127",
-  "description": "特斯拉行车记录仪水印工具 - 本地离线版",
+  "theme_color": "#050505",
+  "orientation": "portrait-primary",
   "icons": [
     {
       "src": "icon.png",
-      "sizes": "512x512",
-      "type": "image/png",
-      "purpose": "any maskable"
+      "sizes": "128x128",
+      "type": "image/png"
     }
   ]
 }

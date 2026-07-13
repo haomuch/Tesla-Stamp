@@ -1348,6 +1348,10 @@
         };
 
         let muxer = null, encoder = null, frameCount = 0;
+        let exportWidth = 0;
+        let exportHeight = 0;
+        let onEncoderError = null;
+        const EXPORT_MAX_WIDTH = 1920;
         const checkCapabilities = () => !!(typeof Mp4Muxer !== 'undefined' && window.VideoEncoder && window.VideoFrame);
 
         const updateStatus = (text, isRec = false) => {
@@ -1362,36 +1366,96 @@
         // Synchronize language and UI elements immediately after functions are ready to prevent flashing
         applyLang(true);
 
+        const getBestSupportedCodec = async (type, width, height, bitrate, framerate) => {
+            const avcCandidates = [
+                'avc1.640033', // High Profile, Level 5.1 (支持 4K 及高帧率)
+                'avc1.64002a', // High Profile, Level 4.2 (支持 1080p 高帧率)
+                'avc1.4d0033', // Main Profile, Level 5.1
+                'avc1.4d002a', // Main Profile, Level 4.2
+                'avc1.4DE028'  // Main Profile, Level 4.0
+            ];
+            const hevcCandidates = [
+                'hvc1.1.6.L150.B0', // Main Profile, Level 5.0, Main Tier
+                'hvc1.1.6.L120.B0'  // Main Profile, Level 4.0, Main Tier
+            ];
+
+            const candidates = type === 'hevc' ? hevcCandidates : avcCandidates;
+
+            for (const codec of candidates) {
+                try {
+                    const support = await VideoEncoder.isConfigSupported({
+                        codec, width, height, bitrate, framerate
+                    });
+                    if (support.supported) {
+                        console.log(`已选择支持的编码格式: ${codec} (分辨率: ${width}x${height})`);
+                        return codec;
+                    }
+                } catch (e) {
+                    console.warn(`检测编码格式 ${codec} 出错:`, e);
+                }
+            }
+            return candidates[candidates.length - 1]; // 兜底使用最低级别
+        };
+
         const initRecorder = async (isHEVC = false) => {
             if (!window.VideoEncoder) return false;
 
-            // 优先尝试与主源相同的编码，若不支持 HEVC 编码则回退到 AVC
-            let encoderCodec = isHEVC ? 'hvc1.1.6.L120.B0' : 'avc1.4DE028';
-            let muxerCodec = isHEVC ? 'hevc' : 'avc';
+            // 计算导出分辨率：如果源视频宽度超过 EXPORT_MAX_WIDTH，等比降采样
+            if (vid.videoWidth > EXPORT_MAX_WIDTH) {
+                const scale = EXPORT_MAX_WIDTH / vid.videoWidth;
+                exportWidth = EXPORT_MAX_WIDTH;
+                // 确保高度为偶数（编码器要求）
+                exportHeight = Math.round(vid.videoHeight * scale) & ~1;
+                console.log(`导出直接降采样：${vid.videoWidth}×${vid.videoHeight} → ${exportWidth}×${exportHeight}`);
+            } else {
+                exportWidth = vid.videoWidth;
+                exportHeight = vid.videoHeight;
+            }
+
+            // 直接调整 WebGL 渲染 canvas 大小，使渲染管线在导出时处于低分辨率，极大地减轻 GPU 负荷并解决 2D 拷贝的问题
+            cvs.width = exportWidth;
+            cvs.height = exportHeight;
+            cachedCanvasWidth = -1;
+            cachedCanvasHeight = -1;
+
+            let encoderCodec = "";
+            let muxerCodec = "avc";
 
             if (isHEVC) {
-                const support = await VideoEncoder.isConfigSupported({
-                    codec: encoderCodec, width: cvs.width, height: cvs.height,
-                    bitrate: targetBitrate, framerate: fps
-                });
-                if (!support.supported) {
-                    encoderCodec = 'avc1.4DE028';
-                    muxerCodec = 'avc';
-                    console.log("环境不支持 HEVC 编码，合成视频将降级使用 H.264 编码。");
-                }
+                // 优先检测最佳 HEVC 编码格式，若不支持则回退
+                const candidateCodec = await getBestSupportedCodec('hevc', exportWidth, exportHeight, targetBitrate, fps);
+                try {
+                    const support = await VideoEncoder.isConfigSupported({
+                        codec: candidateCodec, width: exportWidth, height: exportHeight,
+                        bitrate: targetBitrate, framerate: fps
+                    });
+                    if (support.supported) {
+                        encoderCodec = candidateCodec;
+                        muxerCodec = "hevc";
+                    }
+                } catch (e) {}
+            }
+
+            // 如果不使用 HEVC 或 HEVC 不被支持，则获取并使用最佳的 AVC/H.264 编码规格（自动适配 High Profile 等）
+            if (!encoderCodec) {
+                encoderCodec = await getBestSupportedCodec('avc', exportWidth, exportHeight, targetBitrate, fps);
+                muxerCodec = "avc";
             }
 
             muxer = new Mp4Muxer.Muxer({
                 target: new Mp4Muxer.ArrayBufferTarget(),
-                video: { codec: muxerCodec, width: cvs.width, height: cvs.height },
+                video: { codec: muxerCodec, width: exportWidth, height: exportHeight },
                 fastStart: 'in-memory', firstTimestampBehavior: 'offset'
             });
             encoder = new VideoEncoder({
                 output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-                error: (e) => console.error(e)
+                error: (e) => {
+                    console.error("VideoEncoder error event:", e);
+                    if (onEncoderError) onEncoderError(e);
+                }
             });
             encoder.configure({
-                codec: encoderCodec, width: cvs.width, height: cvs.height,
+                codec: encoderCodec, width: exportWidth, height: exportHeight,
                 bitrate: targetBitrate, framerate: fps
             });
             return true;
@@ -1409,6 +1473,8 @@
                 let recordingStartTime = (vid.currentTime < 0.1) ? 0 : vid.currentTime;
                 frameCount = 0; startRecBtn.disabled = true; stopRecBtn.disabled = false;
                 playPauseBtn.disabled = true; timeSlider.disabled = true;
+
+                let pendingFramesCount = 0;
 
                 currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
                 updateStatus(t('statusPreparing'), true);
@@ -1433,13 +1499,24 @@
                 let decodeLock = Promise.resolve();
 
                 await new Promise(async (resolve, reject) => {
+                    const cleanup = () => {
+                        onEncoderError = null;
+                    };
+
+                    onEncoderError = (err) => {
+                        cleanup();
+                        reject(err);
+                    };
+
                     const decoder = new VideoDecoder({
                         output: (frame) => {
+                            pendingFramesCount++;
                             decodeLock = decodeLock.then(async () => {
-                                if (!isRecording) { frame.close(); return; }
+                                if (!isRecording) { frame.close(); pendingFramesCount--; return; }
                                 try {
                                     const timeSec = frame.timestamp / 1000000;
                                     if (timeSec >= recordingStartTime) {
+                                        // 绘制和编码逻辑
                                         drawFrame(timeSec, frame);
 
                                         if (encoder && encoder.state === 'configured') {
@@ -1455,21 +1532,33 @@
                                             frameCount++;
 
                                             if (frameCount % 10 === 0) {
-                                                currentStatusKey = 'statusSynthesizingProgress'; currentStatusArg = (timeSec - recordingStartTime).toFixed(1); currentStatusIsRec = true;
-                                                statusText.textContent = t('statusSynthesizingProgress', (timeSec - recordingStartTime).toFixed(1));
-                                                timeSlider.value = (timeSec / vid.duration) * 1000;
-                                                timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
+                                                const currentFrameCount = frameCount;
+                                                // 使用 setTimeout/requestAnimationFrame 异步更新 UI，防止阻塞解码线程/主线程
+                                                setTimeout(() => {
+                                                    if (!isRecording) return;
+                                                    currentStatusKey = 'statusSynthesizingProgress'; 
+                                                    currentStatusArg = (timeSec - recordingStartTime).toFixed(1); 
+                                                    currentStatusIsRec = true;
+                                                    statusText.textContent = t('statusSynthesizingProgress', currentStatusArg);
+                                                    timeSlider.value = (timeSec / vid.duration) * 1000;
+                                                    timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
+                                                }, 0);
                                             }
                                         }
                                     }
                                 } catch (e) {
+                                    cleanup();
                                     reject(e);
                                 } finally {
                                     frame.close();
+                                    pendingFramesCount--;
                                 }
                             });
                         },
-                        error: (e) => reject(e)
+                        error: (e) => {
+                            cleanup();
+                            reject(e);
+                        }
                     });
 
                     decoder.configure({
@@ -1483,17 +1572,30 @@
                         if (!isRecording) break;
                         const s = samples[i];
                         decoder.decode(new EncodedVideoChunk({ type: s.type, timestamp: s.timestamp, duration: s.duration, data: s.data }));
-                        if (decoder.decodeQueueSize > 5) await new Promise(r => setTimeout(r, 5));
-                        if (encoder && encoder.encodeQueueSize > 10) await new Promise(r => setTimeout(r, 10));
+                        
+                        // 综合背压控制：不仅检查底层队列，还检查 pendingFramesCount，防止 VideoFrame 池耗尽死锁
+                        while (pendingFramesCount > 3) {
+                            await new Promise(r => setTimeout(r, 15));
+                        }
+                        while (decoder.decodeQueueSize > 3) {
+                            await new Promise(r => setTimeout(r, 15));
+                        }
+                        while (encoder && encoder.encodeQueueSize > 3) {
+                            await new Promise(r => setTimeout(r, 15));
+                        }
+                        // 强制每递送一帧也稍微让出主线程，保障 UI 更新与底层 WebCodecs 引擎调度
+                        await new Promise(r => setTimeout(r, 1));
                     }
 
                     if (isRecording) {
                         await decoder.flush();
                         await decodeLock;
                         decoder.close();
+                        cleanup();
                         await stopRecording();
                     } else {
                         decoder.close();
+                        cleanup();
                     }
                     resolve();
                 });
@@ -1502,6 +1604,13 @@
                 currentStatusKey = 'statusError'; currentStatusArg = e.message; currentStatusIsRec = false;
                 updateStatus(t('statusError', e.message));
                 isRecording = false;
+                // 恢复视频原始分辨率
+                if (vid) {
+                    cvs.width = vid.videoWidth;
+                    cvs.height = vid.videoHeight;
+                    cachedCanvasWidth = -1;
+                    cachedCanvasHeight = -1;
+                }
                 startRecBtn.disabled = false;
                 stopRecBtn.disabled = true;
                 playPauseBtn.disabled = false;
@@ -1513,7 +1622,18 @@
             isRecording = false;
             currentStatusKey = 'statusExporting'; currentStatusArg = null; currentStatusIsRec = false;
             updateStatus(t('statusExporting'));
-            if (encoder && encoder.state !== 'closed') { await encoder.flush(); encoder.close(); }
+            if (encoder && encoder.state !== 'closed') {
+                // 超时保护：防止 flush 在高分辨率帧积压时永远挂起
+                try {
+                    await Promise.race([
+                        encoder.flush(),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('Encoder flush timeout')), 30000))
+                    ]);
+                } catch (e) {
+                    console.warn('Encoder flush 超时或出错，强制关闭:', e.message);
+                }
+                if (encoder.state !== 'closed') encoder.close();
+            }
             if (muxer) {
                 muxer.finalize();
                 const { buffer } = muxer.target;
@@ -1522,6 +1642,13 @@
                 const url = URL.createObjectURL(file);
                 const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
                 setTimeout(() => { URL.revokeObjectURL(url); currentStatusKey = 'statusDone'; currentStatusArg = null; currentStatusIsRec = false; updateStatus(t('statusDone')); }, 1000);
+            }
+            // 恢复视频原始分辨率
+            if (vid) {
+                cvs.width = vid.videoWidth;
+                cvs.height = vid.videoHeight;
+                cachedCanvasWidth = -1;
+                cachedCanvasHeight = -1;
             }
             startRecBtn.disabled = false; stopRecBtn.disabled = true;
             playPauseBtn.disabled = false; timeSlider.disabled = false;
@@ -1802,9 +1929,17 @@
                         const totalVideoBytes = samples.reduce((sum, s) => sum + s.data.length, 0);
                         const durationSec = totalDurationMs / 1000;
                         const originalBitrate = Math.round((totalVideoBytes * 8) / durationSec);
-                        targetBitrate = Math.max(5000000, Math.min(Math.round(originalBitrate * 1.05), 8000000));
+                        // 优化码率策略：高分辨率导出（≤1920 宽）需要充足的码率来保留行车记录仪画面细节（如车牌）
+                        // 避免按像素面积等比缩水导致画质下降。我们将导出码率设为原始码率的 80% - 100%（根据降采样比例）
+                        // 同时限制码率范围在 6 Mbps 至 15 Mbps 之间
+                        const exportW = Math.min(config.width, EXPORT_MAX_WIDTH);
+                        const scaleRatio = exportW / config.width;
+                        const retentionRatio = scaleRatio < 1.0 ? Math.max(0.8, scaleRatio) : 1.0;
+                        const optimalBitrate = Math.round(originalBitrate * retentionRatio);
+                        targetBitrate = Math.max(6000000, Math.min(optimalBitrate, 15000000));
+                        console.log(`码率计算：原始码率=${(originalBitrate/1000000).toFixed(2)}M, 导出目标码率=${(targetBitrate/1000000).toFixed(2)}M`);
                     }
-                } catch (e) { targetBitrate = 5000000; }
+                } catch (e) { targetBitrate = 6000000; }
 
                 // --- 逻辑优化：重新平衡时间源优先级 ---
                 const firstSei = parsedFrames.find(f => f.sei)?.sei;

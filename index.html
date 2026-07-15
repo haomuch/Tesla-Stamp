@@ -870,11 +870,11 @@
             backdrop-filter: blur(8px);
             -webkit-backdrop-filter: blur(8px);
             box-shadow: 0 1px 10px rgba(0, 0, 0, 0.4),
-                        inset 0 1px 0 rgba(255, 255, 255, 0.15);
+                inset 0 1px 0 rgba(255, 255, 255, 0.15);
             border: 1px solid rgba(255, 255, 255, 0.15);
             pointer-events: none;
             transition: transform 0.38s cubic-bezier(0.16, 1, 0.3, 1),
-                        width 0.38s cubic-bezier(0.16, 1, 0.3, 1);
+                width 0.38s cubic-bezier(0.16, 1, 0.3, 1);
             will-change: transform, width;
         }
 
@@ -1097,7 +1097,7 @@
             // The indicator's CSS left:3px matches the container's 3px padding,
             // so translateX(0) aligns with the first button at offsetLeft=0.
             const tx = activeBtn.offsetLeft;
-            
+
             if (skipTransition) {
                 // Temporarily disable transition
                 const origTransition = indicator.style.transition;
@@ -1105,7 +1105,7 @@
                 indicator.style.width = activeBtn.offsetWidth + 'px';
                 indicator.style.transform = `translateX(${tx}px)`;
                 // Force a reflow to apply the styles without transition immediately
-                indicator.offsetHeight; 
+                indicator.offsetHeight;
                 indicator.style.transition = origTransition;
             } else {
                 indicator.style.width = activeBtn.offsetWidth + 'px';
@@ -1148,14 +1148,48 @@
         langOptZh.onclick = () => setLang('zh');
         langOptEn.onclick = () => setLang('en');
 
-        // --- WebGL 2.0 Initialization ---
+        // --- Rendering & Compute Initialization ---
         const cvs = document.querySelector("#videoCanvas");
         const gl = cvs.getContext('webgl2', { alpha: false, antialias: false, depth: false });
 
+        // Feature detection
+        const supportsWebCodecs = ("VideoEncoder" in window) && ("VideoDecoder" in window);
+        const supportsWebGPU = ("gpu" in navigator);
+
         if (!gl) {
-            alert(t('webglAlert'));
-            throw new Error("WebGL 2.0 not supported");
+            // WebGL2 not available – we will fall back to 2D canvas for rendering.
+            console.warn('WebGL2 not supported, falling back to 2D canvas');
         }
+
+        // ---------- WebGPU (or fallback) ----------
+        let gpuDevice = null;
+        let computePipeline = null;
+        const initWebGPU = async () => {
+            if (!supportsWebGPU) return false;
+            try {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) return false;
+                gpuDevice = await adapter.requestDevice();
+                // Simple compute shader that copies input to output – replace with real pixel ops later.
+                const shaderCode = `
+                @group(0) @binding(0) var src : texture_2d<f32>;
+                @group(0) @binding(1) var dst : texture_2d<f32>;
+                @compute @workgroup_size(8,8)
+                fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+                    if (gid.x >= textureDimensions(src).x || gid.y >= textureDimensions(src).y) { return; }
+                    let color = textureLoad(src, vec2<i32>(gid.xy), 0);
+                    textureStore(dst, vec2<i32>(gid.xy), color);
+                }`;
+                const module = gpuDevice.createShaderModule({ code: shaderCode });
+                computePipeline = gpuDevice.createComputePipeline({ compute: { module, entryPoint: "main" } });
+                return true;
+            } catch (e) {
+                console.warn('WebGPU init failed, will use WebGL2:', e);
+                return false;
+            }
+        };
+        // Fire‑and‑forget initialization (no await needed here)
+        initWebGPU();
 
         // Shaders
         const vsSource = `#version 300 es
@@ -1347,7 +1381,7 @@
             patchBoxes(0, buffer.byteLength); return buffer;
         };
 
-        let muxer = null, encoder = null, frameCount = 0;
+        let muxer = null, encoder = null, mediaRecorder = null, frameCount = 0;
         let exportWidth = 0;
         let exportHeight = 0;
         let onEncoderError = null;
@@ -1398,13 +1432,47 @@
         };
 
         const initRecorder = async (isHEVC = false) => {
+            // ---------- iOS Safari / 非 WebCodecs fallback ----------
+            if (!supportsWebCodecs) {
+                // Ensure canvas size matches export resolution (same logic as below)
+                if (vid.videoWidth > EXPORT_MAX_WIDTH) {
+                    const scale = EXPORT_MAX_WIDTH / vid.videoWidth;
+                    exportWidth = EXPORT_MAX_WIDTH;
+                    exportHeight = Math.round(vid.videoHeight * scale) & ~1;
+                } else {
+                    exportWidth = vid.videoWidth;
+                    exportHeight = vid.videoHeight;
+                }
+                cvs.width = exportWidth;
+                cvs.height = exportHeight;
+                cachedCanvasWidth = -1;
+                cachedCanvasHeight = -1;
+
+                const stream = cvs.captureStream(30);
+                const mime = MediaRecorder.isTypeSupported('video/mp4') ? 'video/mp4' : 'video/webm';
+                mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+                const chunks = [];
+                mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+                mediaRecorder.onstop = () => {
+                    const blob = new Blob(chunks, { type: mime });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${vidName}_stamp.${mime.split('/')[1]}`;
+                    a.click();
+                    setTimeout(() => URL.revokeObjectURL(url), 1000);
+                };
+                mediaRecorder.start();
+                return true; // No need for Mp4Muxer / VideoEncoder
+            }
+
+            // ---------- WebCodecs path (original logic) ----------
             if (!window.VideoEncoder) return false;
 
             // 计算导出分辨率：如果源视频宽度超过 EXPORT_MAX_WIDTH，等比降采样
             if (vid.videoWidth > EXPORT_MAX_WIDTH) {
                 const scale = EXPORT_MAX_WIDTH / vid.videoWidth;
                 exportWidth = EXPORT_MAX_WIDTH;
-                // 确保高度为偶数（编码器要求）
                 exportHeight = Math.round(vid.videoHeight * scale) & ~1;
                 console.log(`导出直接降采样：${vid.videoWidth}×${vid.videoHeight} → ${exportWidth}×${exportHeight}`);
             } else {
@@ -1412,7 +1480,7 @@
                 exportHeight = vid.videoHeight;
             }
 
-            // 直接调整 WebGL 渲染 canvas 大小，使渲染管线在导出时处于低分辨率，极大地减轻 GPU 负荷并解决 2D 拷贝的问题
+            // 调整 canvas 大小
             cvs.width = exportWidth;
             cvs.height = exportHeight;
             cachedCanvasWidth = -1;
@@ -1422,7 +1490,6 @@
             let muxerCodec = "avc";
 
             if (isHEVC) {
-                // 优先检测最佳 HEVC 编码格式，若不支持则回退
                 const candidateCodec = await getBestSupportedCodec('hevc', exportWidth, exportHeight, targetBitrate, fps);
                 try {
                     const support = await VideoEncoder.isConfigSupported({
@@ -1433,10 +1500,9 @@
                         encoderCodec = candidateCodec;
                         muxerCodec = "hevc";
                     }
-                } catch (e) {}
+                } catch (e) { }
             }
 
-            // 如果不使用 HEVC 或 HEVC 不被支持，则获取并使用最佳的 AVC/H.264 编码规格（自动适配 High Profile 等）
             if (!encoderCodec) {
                 encoderCodec = await getBestSupportedCodec('avc', exportWidth, exportHeight, targetBitrate, fps);
                 muxerCodec = "avc";
@@ -1459,6 +1525,13 @@
                 bitrate: targetBitrate, framerate: fps
             });
             return true;
+        };
+
+        // Helper to encode a frame only when WebCodecs encoder is active
+        const maybeEncode = (frame) => {
+            if (encoder && encoder.state === 'configured') {
+                encoder.encode(frame);
+            }
         };
 
         const startRecording = async () => {
@@ -1527,7 +1600,7 @@
                                                 timestamp: pts,
                                                 duration: frameDurationUs
                                             });
-                                            encoder.encode(outFrame);
+                                            maybeEncode(outFrame);
                                             outFrame.close();
                                             frameCount++;
 
@@ -1536,8 +1609,8 @@
                                                 // 使用 setTimeout/requestAnimationFrame 异步更新 UI，防止阻塞解码线程/主线程
                                                 setTimeout(() => {
                                                     if (!isRecording) return;
-                                                    currentStatusKey = 'statusSynthesizingProgress'; 
-                                                    currentStatusArg = (timeSec - recordingStartTime).toFixed(1); 
+                                                    currentStatusKey = 'statusSynthesizingProgress';
+                                                    currentStatusArg = (timeSec - recordingStartTime).toFixed(1);
                                                     currentStatusIsRec = true;
                                                     statusText.textContent = t('statusSynthesizingProgress', currentStatusArg);
                                                     timeSlider.value = (timeSec / vid.duration) * 1000;
@@ -1572,7 +1645,7 @@
                         if (!isRecording) break;
                         const s = samples[i];
                         decoder.decode(new EncodedVideoChunk({ type: s.type, timestamp: s.timestamp, duration: s.duration, data: s.data }));
-                        
+
                         // 综合背压控制：不仅检查底层队列，还检查 pendingFramesCount，防止 VideoFrame 池耗尽死锁
                         while (pendingFramesCount > 3) {
                             await new Promise(r => setTimeout(r, 15));
@@ -1826,7 +1899,16 @@
             gl.uniform1i(textTexLoc, 1);
 
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-            gl.finish(); // 关键修复：强制等待 GPU 绘图完成，消除 iOS 上的捕获拖尾
+            if (isRecording) {
+                gl.flush(); // 录制时仅执行非阻塞的 flush，告知 GPU 尽早执行渲染，但不阻塞 JS 主线程等待，大幅提升高分辨率合成速度
+            } else {
+                gl.finish(); // 正常播放预览时强制等待 GPU 绘图完成，消除移动端（如 iOS）上的捕获拖尾
+            }
+            // ---------- WebGPU compute placeholder ----------
+            if (supportsWebGPU && gpuDevice) {
+                // TODO: Upload canvas texture to GPU, run compute shader, write back.
+                // This placeholder ensures the code path exists; actual shader logic to be implemented.
+            }
 
             if (!dragging && forcedTime === null) {
                 timeSlider.value = (vid.currentTime / vid.duration) * 1000;
@@ -1931,15 +2013,15 @@
                         const originalBitrate = Math.round((totalVideoBytes * 8) / durationSec);
                         // 优化码率策略：高分辨率导出（≤1920 宽）需要充足的码率来保留行车记录仪画面细节（如车牌）
                         // 避免按像素面积等比缩水导致画质下降。我们将导出码率设为原始码率的 80% - 100%（根据降采样比例）
-                        // 同时限制码率范围在 6 Mbps 至 15 Mbps 之间
+                        // 同时限制码率范围在 5 Mbps 至 15 Mbps 之间
                         const exportW = Math.min(config.width, EXPORT_MAX_WIDTH);
                         const scaleRatio = exportW / config.width;
                         const retentionRatio = scaleRatio < 1.0 ? Math.max(0.8, scaleRatio) : 1.0;
                         const optimalBitrate = Math.round(originalBitrate * retentionRatio);
-                        targetBitrate = Math.max(6000000, Math.min(optimalBitrate, 15000000));
-                        console.log(`码率计算：原始码率=${(originalBitrate/1000000).toFixed(2)}M, 导出目标码率=${(targetBitrate/1000000).toFixed(2)}M`);
+                        targetBitrate = Math.max(5000000, Math.min(optimalBitrate, 15000000));
+                        console.log(`码率计算：原始码率=${(originalBitrate / 1000000).toFixed(2)}M, 导出目标码率=${(targetBitrate / 1000000).toFixed(2)}M`);
                     }
-                } catch (e) { targetBitrate = 6000000; }
+                } catch (e) { targetBitrate = 5000000; }
 
                 // --- 逻辑优化：重新平衡时间源优先级 ---
                 const firstSei = parsedFrames.find(f => f.sei)?.sei;

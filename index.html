@@ -1662,26 +1662,31 @@
                     // 批量投递解码块：一次性投递多帧后再检查背压，减少主线程让出次数
                     const BATCH_SIZE = 8;
                     let batchCounter = 0;
+                    // macrotask 让出：让事件循环完整 tick，给解码器/编码器硬件时间消化队列。
+                    // microtask(Promise.resolve) 在同一 tick 内执行，不足以让硬件解码器处理完帧。
+                    const yieldMacrotask = () => new Promise(r => setTimeout(r, 0));
 
                     for (let i = startIdx; i < samples.length; i++) {
                         if (!isRecording) break;
+                        // 投递前先检查解码器队列深度，防止硬件解码器资源耗尽触发 Decoding error。
+                        // 阈值 8：留出余量，避免队列积压到上限。
+                        while (isRecording && decoder.decodeQueueSize > 8) {
+                            await yieldMacrotask();
+                        }
                         const s = samples[i];
                         decoder.decode(new EncodedVideoChunk({ type: s.type, timestamp: s.timestamp, duration: s.duration, data: s.data }));
 
                         batchCounter++;
-                        // 仅每 BATCH_SIZE 帧检查一次背压，避免每帧让出主线程
+                        // 仅每 BATCH_SIZE 帧检查一次输出侧背压，避免每帧让出主线程
                         if (batchCounter >= BATCH_SIZE) {
                             batchCounter = 0;
                             // 事件驱动背压：等待 pending 帧降到阈值以下，而非固定 15ms 轮询
                             while (pendingFramesCount > 4 && isRecording) {
                                 await waitForFrameProcessed();
                             }
-                            // 解码器/编码器队列背压：仅在队列过深时让出，用 microtask 而非 setTimeout
-                            if (decoder.decodeQueueSize > 16) {
-                                await Promise.resolve();
-                            }
-                            if (encoder && encoder.encodeQueueSize > 16) {
-                                await Promise.resolve();
+                            // 编码器队列背压：队列过深时用 macrotask 让出，给硬件编码器时间消化
+                            if (encoder && encoder.encodeQueueSize > 8) {
+                                await yieldMacrotask();
                             }
                         }
                     }
@@ -1945,9 +1950,13 @@
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
             if (!isRecording) {
                 gl.finish(); // 正常播放预览时强制等待 GPU 绘图完成，消除移动端（如 iOS）上的捕获拖尾
+            } else {
+                // 录制时用 flush()（非阻塞）提交 GPU 命令，保证 canvas 有"已完成帧"供 VideoFrame(cvs) 捕获。
+                // flush 只提交命令到 GPU 队列、不阻塞 CPU 等待完成，性能开销极小；
+                // 但能避免 GPU 命令积压时 VideoFrame(cvs) 抛出 "Canvas has no frame"。
+                // 注意：不能用 finish()，否则会阻塞主线程破坏吞吐。
+                gl.flush();
             }
-            // 录制时不再调用 gl.flush()/finish()：VideoFrame(cvs, ...) 构造时会隐式同步 canvas 渲染，
-            // 让 GPU 命令批处理保持连续，大幅提升高分辨率合成吞吐量
             // ---------- WebGPU compute placeholder ----------
             if (supportsWebGPU && gpuDevice) {
                 // TODO: Upload canvas texture to GPU, run compute shader, write back.

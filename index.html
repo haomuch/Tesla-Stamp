@@ -1656,39 +1656,34 @@
                         codec: config.codec,
                         codedWidth: config.width,
                         codedHeight: config.height,
-                        description: config.description
+                        description: config.description,
+                        // 让浏览器自主选择硬件/软件解码路径，避免某些硬件解码器在长时间高负载下状态异常
+                        hardwareAcceleration: 'no-preference'
                     });
 
-                    // 批量投递解码块：一次性投递多帧后再检查背压，减少主线程让出次数
-                    const BATCH_SIZE = 8;
-                    let batchCounter = 0;
-                    // macrotask 让出：让事件循环完整 tick，给解码器/编码器硬件时间消化队列。
-                    // microtask(Promise.resolve) 在同一 tick 内执行，不足以让硬件解码器处理完帧。
+                    // 逐帧投递 + 严格背压：防止解码器内部 DPB（Decoded Picture Buffer）积压触发 Decoding error。
+                    // 关键：decodeQueueSize 只反映"已投递但解码器尚未开始处理的块"，不反映 DPB 内已解码未 output 的帧。
+                    // output 回调里同步执行 drawFrame+VideoFrame(cvs)+encode，高分辨率下耗时较长，会阻塞 output 回调，
+                    // 导致 DPB 持续积压。因此必须用 pendingFramesCount（反映 output 回调是否完成）做严格背压。
                     const yieldMacrotask = () => new Promise(r => setTimeout(r, 0));
 
                     for (let i = startIdx; i < samples.length; i++) {
                         if (!isRecording) break;
-                        // 投递前先检查解码器队列深度，防止硬件解码器资源耗尽触发 Decoding error。
-                        // 阈值 8：留出余量，避免队列积压到上限。
-                        while (isRecording && decoder.decodeQueueSize > 8) {
+                        // 投递前严格等待：上一帧的 output 回调（drawFrame+encode）必须完成，确保 DPB 有空间。
+                        // pendingFramesCount > 0 表示上一帧还在 output 回调中渲染/编码，等待其完成。
+                        while (isRecording && pendingFramesCount > 0) {
+                            await waitForFrameProcessed();
+                        }
+                        // 解码器投递队列背压：decodeQueueSize 阈值降到 2，避免解码器内部缓冲过深。
+                        while (isRecording && decoder.decodeQueueSize > 2) {
+                            await yieldMacrotask();
+                        }
+                        // 编码器队列背压：编码器积压过深时让出，给硬件编码器时间消化
+                        while (isRecording && encoder && encoder.encodeQueueSize > 4) {
                             await yieldMacrotask();
                         }
                         const s = samples[i];
                         decoder.decode(new EncodedVideoChunk({ type: s.type, timestamp: s.timestamp, duration: s.duration, data: s.data }));
-
-                        batchCounter++;
-                        // 仅每 BATCH_SIZE 帧检查一次输出侧背压，避免每帧让出主线程
-                        if (batchCounter >= BATCH_SIZE) {
-                            batchCounter = 0;
-                            // 事件驱动背压：等待 pending 帧降到阈值以下，而非固定 15ms 轮询
-                            while (pendingFramesCount > 4 && isRecording) {
-                                await waitForFrameProcessed();
-                            }
-                            // 编码器队列背压：队列过深时用 macrotask 让出，给硬件编码器时间消化
-                            if (encoder && encoder.encodeQueueSize > 8) {
-                                await yieldMacrotask();
-                            }
-                        }
                     }
 
                     if (isRecording) {

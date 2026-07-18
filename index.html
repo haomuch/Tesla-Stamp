@@ -1192,7 +1192,11 @@
                     textureStore(dst, vec2<i32>(gid.xy), color);
                 }`;
                 const module = gpuDevice.createShaderModule({ code: shaderCode });
-                computePipeline = gpuDevice.createComputePipeline({ compute: { module, entryPoint: "main" } });
+                // 为管线显式指定布局，使用自动布局模式以兼容当前规范
+                computePipeline = gpuDevice.createComputePipeline({
+                    layout: "auto",
+                    compute: { module, entryPoint: "main" }
+                });
                 return true;
             } catch (e) {
                 console.warn('WebGPU init failed, will use WebGL2:', e);

@@ -209,12 +209,20 @@
                 let currentSample = 0;
                 let currentTimeUs = 0;
 
+                // 线性游标：stsc 表按 firstChunk 升序排列，用游标递增替代每帧 reduce 查找（O(n²)→O(n)）
+                let stscCursor = 0;
+                let currentSamplesPerChunk = sampleToChunk.length > 0 ? sampleToChunk[0].samplesPerChunk : 1;
+
                 for (let i = 0; i < chunkOffsets.length; i++) {
                     const chunkIdx = i + 1;
-                    const stscEntry = sampleToChunk.reduce((prev, cur) => (chunkIdx >= cur.firstChunk ? cur : prev));
+                    // 推进游标到当前 chunk 所属的 stsc 区间
+                    while (stscCursor + 1 < sampleToChunk.length && chunkIdx >= sampleToChunk[stscCursor + 1].firstChunk) {
+                        stscCursor++;
+                        currentSamplesPerChunk = sampleToChunk[stscCursor].samplesPerChunk;
+                    }
                     let offset = chunkOffsets[i];
 
-                    for (let j = 0; j < stscEntry.samplesPerChunk; j++) {
+                    for (let j = 0; j < currentSamplesPerChunk; j++) {
                         if (currentSample >= sampleCount) break;
                         const size = sampleSizes[currentSample];
                         const durationMs = config.durations[currentSample] || (1000 / 36);
@@ -298,14 +306,17 @@
             }
 
             stripEmulationBytes(data) {
-                const out = [];
+                // 预分配最大可能长度，用写入索引替代数组 push + from，避免逐字节装箱开销
+                const out = new Uint8Array(data.length);
                 let zeros = 0;
-                for (const byte of data) {
+                let w = 0;
+                for (let i = 0; i < data.length; i++) {
+                    const byte = data[i];
                     if (zeros >= 2 && byte === 0x03) { zeros = 0; continue; }
-                    out.push(byte);
+                    out[w++] = byte;
                     zeros = byte === 0 ? zeros + 1 : 0;
                 }
-                return Uint8Array.from(out);
+                return out.subarray(0, w);
             }
 
             readAscii(start, len) {
@@ -1282,6 +1293,8 @@
         let cachedCanvasHeight = -1;
         let cachedFontSize = 0;
         let cachedTextWidth = 0;
+        // 布局度量缓存：固定字符串的宽度在字号不变时恒定，避免每帧重复 measureText
+        let cachedLayout = null;
 
         // UI toggles
         const guideHeader = document.querySelector("#guideHeader");
@@ -1547,7 +1560,13 @@
                 frameCount = 0; startRecBtn.disabled = true; stopRecBtn.disabled = false;
                 playPauseBtn.disabled = true; timeSlider.disabled = true;
 
+                // 事件驱动的背压控制：用 Promise 替代 setTimeout 轮询，避免 15ms 空转
                 let pendingFramesCount = 0;
+                let frameProcessedResolve = null;
+                const frameProcessedSignal = () => {
+                    if (frameProcessedResolve) { const r = frameProcessedResolve; frameProcessedResolve = null; r(); }
+                };
+                const waitForFrameProcessed = () => new Promise(r => { frameProcessedResolve = r; });
 
                 currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
                 updateStatus(t('statusPreparing'), true);
@@ -1569,7 +1588,9 @@
                 currentStatusKey = 'statusSynthesizing'; currentStatusArg = null; currentStatusIsRec = true;
                 updateStatus(t('statusSynthesizing'), true);
 
-                let decodeLock = Promise.resolve();
+                // 解码输出回调：直接同步处理，移除 decodeLock 串行链，让 WebCodecs 内部并行调度
+                // drawFrame（GPU 上传）与 encoder.encode（硬件编码）可并行，无需 JS 层串行化
+                let lastUiUpdateTs = 0;
 
                 await new Promise(async (resolve, reject) => {
                     const cleanup = () => {
@@ -1584,49 +1605,46 @@
                     const decoder = new VideoDecoder({
                         output: (frame) => {
                             pendingFramesCount++;
-                            decodeLock = decodeLock.then(async () => {
-                                if (!isRecording) { frame.close(); pendingFramesCount--; return; }
-                                try {
-                                    const timeSec = frame.timestamp / 1000000;
-                                    if (timeSec >= recordingStartTime) {
-                                        // 绘制和编码逻辑
-                                        drawFrame(timeSec, frame);
+                            try {
+                                if (!isRecording) { frame.close(); pendingFramesCount--; frameProcessedSignal(); return; }
+                                const timeSec = frame.timestamp / 1000000;
+                                if (timeSec >= recordingStartTime) {
+                                    // 绘制和编码逻辑
+                                    drawFrame(timeSec, frame);
 
-                                        if (encoder && encoder.state === 'configured') {
-                                            // 恢复稳定的时间戳算法，解决变速/慢动作问题
-                                            const pts = Math.round(frameCount * frameDurationUs);
+                                    if (encoder && encoder.state === 'configured') {
+                                        // 恢复稳定的时间戳算法，解决变速/慢动作问题
+                                        const pts = Math.round(frameCount * frameDurationUs);
 
-                                            const outFrame = new VideoFrame(cvs, {
-                                                timestamp: pts,
-                                                duration: frameDurationUs
-                                            });
-                                            maybeEncode(outFrame);
-                                            outFrame.close();
-                                            frameCount++;
+                                        const outFrame = new VideoFrame(cvs, {
+                                            timestamp: pts,
+                                            duration: frameDurationUs
+                                        });
+                                        maybeEncode(outFrame);
+                                        outFrame.close();
+                                        frameCount++;
 
-                                            if (frameCount % 10 === 0) {
-                                                const currentFrameCount = frameCount;
-                                                // 使用 setTimeout/requestAnimationFrame 异步更新 UI，防止阻塞解码线程/主线程
-                                                setTimeout(() => {
-                                                    if (!isRecording) return;
-                                                    currentStatusKey = 'statusSynthesizingProgress';
-                                                    currentStatusArg = (timeSec - recordingStartTime).toFixed(1);
-                                                    currentStatusIsRec = true;
-                                                    statusText.textContent = t('statusSynthesizingProgress', currentStatusArg);
-                                                    timeSlider.value = (timeSec / vid.duration) * 1000;
-                                                    timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
-                                                }, 0);
-                                            }
+                                        // UI 更新限频：最多每 100ms 更新一次，避免阻塞主线程
+                                        const now = performance.now();
+                                        if (now - lastUiUpdateTs > 100) {
+                                            lastUiUpdateTs = now;
+                                            currentStatusKey = 'statusSynthesizingProgress';
+                                            currentStatusArg = (timeSec - recordingStartTime).toFixed(1);
+                                            currentStatusIsRec = true;
+                                            statusText.textContent = t('statusSynthesizingProgress', currentStatusArg);
+                                            timeSlider.value = (timeSec / vid.duration) * 1000;
+                                            timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
                                         }
                                     }
-                                } catch (e) {
-                                    cleanup();
-                                    reject(e);
-                                } finally {
-                                    frame.close();
-                                    pendingFramesCount--;
                                 }
-                            });
+                            } catch (e) {
+                                cleanup();
+                                reject(e);
+                            } finally {
+                                frame.close();
+                                pendingFramesCount--;
+                                frameProcessedSignal();
+                            }
                         },
                         error: (e) => {
                             cleanup();
@@ -1641,28 +1659,39 @@
                         description: config.description
                     });
 
+                    // 批量投递解码块：一次性投递多帧后再检查背压，减少主线程让出次数
+                    const BATCH_SIZE = 8;
+                    let batchCounter = 0;
+
                     for (let i = startIdx; i < samples.length; i++) {
                         if (!isRecording) break;
                         const s = samples[i];
                         decoder.decode(new EncodedVideoChunk({ type: s.type, timestamp: s.timestamp, duration: s.duration, data: s.data }));
 
-                        // 综合背压控制：不仅检查底层队列，还检查 pendingFramesCount，防止 VideoFrame 池耗尽死锁
-                        while (pendingFramesCount > 3) {
-                            await new Promise(r => setTimeout(r, 15));
+                        batchCounter++;
+                        // 仅每 BATCH_SIZE 帧检查一次背压，避免每帧让出主线程
+                        if (batchCounter >= BATCH_SIZE) {
+                            batchCounter = 0;
+                            // 事件驱动背压：等待 pending 帧降到阈值以下，而非固定 15ms 轮询
+                            while (pendingFramesCount > 4 && isRecording) {
+                                await waitForFrameProcessed();
+                            }
+                            // 解码器/编码器队列背压：仅在队列过深时让出，用 microtask 而非 setTimeout
+                            if (decoder.decodeQueueSize > 16) {
+                                await Promise.resolve();
+                            }
+                            if (encoder && encoder.encodeQueueSize > 16) {
+                                await Promise.resolve();
+                            }
                         }
-                        while (decoder.decodeQueueSize > 3) {
-                            await new Promise(r => setTimeout(r, 15));
-                        }
-                        while (encoder && encoder.encodeQueueSize > 3) {
-                            await new Promise(r => setTimeout(r, 15));
-                        }
-                        // 强制每递送一帧也稍微让出主线程，保障 UI 更新与底层 WebCodecs 引擎调度
-                        await new Promise(r => setTimeout(r, 1));
                     }
 
                     if (isRecording) {
                         await decoder.flush();
-                        await decodeLock;
+                        // 等待所有 pending 帧处理完成
+                        while (pendingFramesCount > 0) {
+                            await waitForFrameProcessed();
+                        }
                         decoder.close();
                         cleanup();
                         await stopRecording();
@@ -1759,6 +1788,20 @@
                 textCtx.textBaseline = 'middle';
                 cachedTextWidth = textCtx.measureText(testString).width;
 
+                // 一次性预计算所有固定字符串的宽度，避免每帧重复 measureText
+                cachedLayout = {
+                    apSlotW: textCtx.measureText("AP:AUTO").width,
+                    brakeSlotW: textCtx.measureText("Brake:OFF").width,
+                    accelLabel: "Accel:",
+                    accelLabelW: textCtx.measureText("Accel:").width,
+                    accelUnit: "%",
+                    accelUnitW: textCtx.measureText("%").width,
+                    accelDigit2W: textCtx.measureText("00").width,
+                    digitSlotW: textCtx.measureText("000").width,
+                    unitStr: " km/h",
+                    unitW: textCtx.measureText(" km/h").width
+                };
+
 
 
                 // Force texture update flag
@@ -1822,17 +1865,18 @@
                 textCtx.fillText(timeStr, innerLeft, centerY);
 
                 // --- Right-Aligned Cluster Logic ---
-                // Define fixed slot widths for each element
-                const apSlotW = textCtx.measureText("AP:AUTO").width;
-                const brakeSlotW = textCtx.measureText("Brake:OFF").width;
-                const accelLabel = "Accel:";
-                const accelUnit = "%";
-                const accelDigit2W = textCtx.measureText("00").width;
+                // 复用缓存的固定字符串宽度，避免每帧重复 measureText
+                const L = cachedLayout;
+                const apSlotW = L.apSlotW;
+                const brakeSlotW = L.brakeSlotW;
+                const accelLabel = L.accelLabel;
+                const accelUnit = L.accelUnit;
+                const accelDigit2W = L.accelDigit2W;
                 // Use fixed 2-digit width for overall layout calculation to lock Accel: position
-                const accelSlotW = textCtx.measureText(accelLabel).width + accelDigit2W + textCtx.measureText(accelUnit).width;
-                const digitSlotW = textCtx.measureText("000").width;
-                const unitStr = " km/h";
-                const unitW = textCtx.measureText(unitStr).width;
+                const accelSlotW = L.accelLabelW + accelDigit2W + L.accelUnitW;
+                const digitSlotW = L.digitSlotW;
+                const unitStr = L.unitStr;
+                const unitW = L.unitW;
                 const speedSlotW = digitSlotW + unitW;
 
                 // Calculate fixed starting X positions for each column (Right to Left)
@@ -1851,7 +1895,7 @@
 
                 // 4. Accelerator Position
                 textCtx.fillText(accelLabel, accelX, centerY);
-                const accelLabelW = textCtx.measureText(accelLabel).width;
+                const accelLabelW = L.accelLabelW;
 
                 // Dynamic offset for digits end point: pushes % right if > 2 digits
                 const accelValW = textCtx.measureText(accelVal).width;
@@ -1899,11 +1943,11 @@
             gl.uniform1i(textTexLoc, 1);
 
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-            if (isRecording) {
-                gl.flush(); // 录制时仅执行非阻塞的 flush，告知 GPU 尽早执行渲染，但不阻塞 JS 主线程等待，大幅提升高分辨率合成速度
-            } else {
+            if (!isRecording) {
                 gl.finish(); // 正常播放预览时强制等待 GPU 绘图完成，消除移动端（如 iOS）上的捕获拖尾
             }
+            // 录制时不再调用 gl.flush()/finish()：VideoFrame(cvs, ...) 构造时会隐式同步 canvas 渲染，
+            // 让 GPU 命令批处理保持连续，大幅提升高分辨率合成吞吐量
             // ---------- WebGPU compute placeholder ----------
             if (supportsWebGPU && gpuDevice) {
                 // TODO: Upload canvas texture to GPU, run compute shader, write back.

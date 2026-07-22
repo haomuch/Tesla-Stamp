@@ -34,6 +34,7 @@
                 this._config = null;
                 this._samples = null;
                 this.isHEVC = false;
+                this._reusableSeiBuf = new Uint8Array(65536);
             }
 
             findBox(start, end, name) {
@@ -226,14 +227,23 @@
                         if (currentSample >= sampleCount) break;
                         const size = sampleSizes[currentSample];
                         const durationMs = config.durations[currentSample] || (1000 / 36);
-
                         const ptsOffsetUs = ptsOffsets ? (ptsOffsets[currentSample] / config.timescale) * 1000000 : 0;
-                        samples.push({
-                            data: new Uint8Array(this.buffer.subarray(offset, offset + size)),
+                        const sampleObj = {
+                            offset,
+                            size,
                             timestamp: Math.round(currentTimeUs + ptsOffsetUs),
                             duration: Math.round(durationMs * 1000),
-                            type: keyframes.has(currentSample) ? 'key' : 'delta'
+                            type: keyframes.has(currentSample) ? 'key' : 'delta',
+                            _buffer: this.buffer
+                        };
+                        Object.defineProperty(sampleObj, 'data', {
+                            get() {
+                                return new Uint8Array(this._buffer.subarray(this.offset, this.offset + this.size));
+                            },
+                            configurable: true,
+                            enumerable: true
                         });
+                        samples.push(sampleObj);
 
                         offset += size;
                         currentTimeUs += durationMs * 1000;
@@ -306,8 +316,10 @@
             }
 
             stripEmulationBytes(data) {
-                // 预分配最大可能长度，用写入索引替代数组 push + from，避免逐字节装箱开销
-                const out = new Uint8Array(data.length);
+                if (!this._reusableSeiBuf || this._reusableSeiBuf.length < data.length) {
+                    this._reusableSeiBuf = new Uint8Array(Math.max(65536, data.length * 2));
+                }
+                const out = this._reusableSeiBuf;
                 let zeros = 0;
                 let w = 0;
                 for (let i = 0; i < data.length; i++) {
@@ -1222,13 +1234,19 @@
         in vec2 v_texCoord;
         uniform sampler2D u_videoTex;
         uniform sampler2D u_textTex;
+        uniform float u_barRatio;
         out vec4 outColor;
         
         void main() {
             vec4 vidColor = texture(u_videoTex, v_texCoord);
-            vec4 textColor = texture(u_textTex, v_texCoord);
+            vec4 textColor = vec4(0.0);
             
-            // Alpha blending text over video
+            float barStart = 1.0 - u_barRatio;
+            if (v_texCoord.y >= barStart && u_barRatio > 0.0) {
+                vec2 textUV = vec2(v_texCoord.x, (v_texCoord.y - barStart) / u_barRatio);
+                textColor = texture(u_textTex, textUV);
+            }
+            
             outColor = mix(vidColor, textColor, textColor.a);
         }`;
 
@@ -1261,6 +1279,7 @@
         const texCoordLoc = gl.getAttribLocation(program, "a_texCoord");
         const videoTexLoc = gl.getUniformLocation(program, "u_videoTex");
         const textTexLoc = gl.getUniformLocation(program, "u_textTex");
+        const barRatioLoc = gl.getUniformLocation(program, "u_barRatio");
 
         // Fullscreen quad
         const positionBuffer = gl.createBuffer();
@@ -1665,11 +1684,19 @@
                         hardwareAcceleration: 'no-preference'
                     });
 
-                    // 逐帧投递 + 严格背压：防止解码器内部 DPB（Decoded Picture Buffer）积压触发 Decoding error。
-                    // 关键：decodeQueueSize 只反映"已投递但解码器尚未开始处理的块"，不反映 DPB 内已解码未 output 的帧。
-                    // output 回调里同步执行 drawFrame+VideoFrame(cvs)+encode，高分辨率下耗时较长，会阻塞 output 回调，
-                    // 导致 DPB 持续积压。因此必须用 pendingFramesCount（反映 output 回调是否完成）做严格背压。
-                    const yieldMacrotask = () => new Promise(r => setTimeout(r, 0));
+                    // 零延迟 MessageChannel 宏任务出让器，替代传统的 setTimeout(r, 0)
+                    const yieldMacrotask = (() => {
+                        const channel = new MessageChannel();
+                        const callbacks = [];
+                        channel.port1.onmessage = () => {
+                            const cb = callbacks.shift();
+                            if (cb) cb();
+                        };
+                        return () => new Promise(r => {
+                            callbacks.push(r);
+                            channel.port2.postMessage(null);
+                        });
+                    })();
 
                     for (let i = startIdx; i < samples.length; i++) {
                         if (!isRecording) break;
@@ -1771,8 +1798,6 @@
             if (cvs.width !== cachedCanvasWidth || cvs.height !== cachedCanvasHeight) {
                 cachedCanvasWidth = cvs.width;
                 cachedCanvasHeight = cvs.height;
-                textCanvas.width = cvs.width;
-                textCanvas.height = cvs.height;
                 gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
 
                 let fontSize = cvs.width / 40;
@@ -1789,6 +1814,13 @@
                     textCtx.font = `400 ${fontSize}px ${fontStack}`;
                 }
                 cachedFontSize = fontSize;
+
+                // 优化：textCanvas 仅保留底栏水印高度，大幅降低纹理传输开销
+                const bgH = Math.ceil(cachedFontSize * 2);
+                textCanvas.width = cvs.width;
+                textCanvas.height = bgH;
+
+                textCtx.font = `400 ${fontSize}px ${fontStack}`;
                 textCtx.textBaseline = 'middle';
                 cachedTextWidth = textCtx.measureText(testString).width;
 
@@ -1805,8 +1837,6 @@
                     unitStr: " km/h",
                     unitW: textCtx.measureText(" km/h").width
                 };
-
-
 
                 // Force texture update flag
                 lastRenderedTimeStr = "";
@@ -1847,10 +1877,8 @@
 
             // 3. Update Text Texture ONLY if strings changed (Diffing update)
             if (timeStr !== lastRenderedTimeStr || seiText !== lastRenderedSeiStr) {
-                textCtx.clearRect(0, 0, textCanvas.width, textCanvas.height);
-
-                const bgH = cachedFontSize * 2;
-                const bgY = cvs.height - bgH;
+                const bgH = textCanvas.height;
+                textCtx.clearRect(0, 0, textCanvas.width, bgH);
 
                 const pad = cachedFontSize * 0.5;
                 const innerLeft = pad;
@@ -1858,10 +1886,10 @@
 
                 // Draw unified opaque dark grey background across whole bottom width
                 textCtx.fillStyle = '#1a1a1a';
-                textCtx.fillRect(0, bgY, cvs.width, bgH);
+                textCtx.fillRect(0, 0, cvs.width, bgH);
 
                 textCtx.fillStyle = '#d1d1d1';
-                const centerY = bgY + bgH * 0.5;
+                const centerY = bgH * 0.5;
                 const seiGap = cachedFontSize * 1.75;
 
                 // 1. Date/Time (Left aligned)
@@ -1945,15 +1973,14 @@
 
             gl.uniform1i(videoTexLoc, 0);
             gl.uniform1i(textTexLoc, 1);
+            const barRatio = cachedCanvasHeight > 0 ? (textCanvas.height / cachedCanvasHeight) : 0;
+            gl.uniform1f(barRatioLoc, barRatio);
 
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-            if (!isRecording) {
-                gl.finish(); // 正常播放预览时强制等待 GPU 绘图完成，消除移动端（如 iOS）上的捕获拖尾
-            } else {
+            if (isRecording) {
                 // 录制时用 flush()（非阻塞）提交 GPU 命令，保证 canvas 有"已完成帧"供 VideoFrame(cvs) 捕获。
                 // flush 只提交命令到 GPU 队列、不阻塞 CPU 等待完成，性能开销极小；
                 // 但能避免 GPU 命令积压时 VideoFrame(cvs) 抛出 "Canvas has no frame"。
-                // 注意：不能用 finish()，否则会阻塞主线程破坏吞吐。
                 gl.flush();
             }
             // ---------- WebGPU compute placeholder ----------

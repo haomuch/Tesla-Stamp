@@ -1116,18 +1116,13 @@
                 ? document.getElementById('langOptZh')
                 : document.getElementById('langOptEn');
             if (!indicator || !activeBtn) return;
-            // offsetLeft is relative to .lang-switcher (position:relative parent)
-            // The indicator's CSS left:3px matches the container's 3px padding,
-            // so translateX(0) aligns with the first button at offsetLeft=0.
             const tx = activeBtn.offsetLeft;
 
             if (skipTransition) {
-                // Temporarily disable transition
                 const origTransition = indicator.style.transition;
                 indicator.style.transition = 'none';
                 indicator.style.width = activeBtn.offsetWidth + 'px';
                 indicator.style.transform = `translateX(${tx}px)`;
-                // Force a reflow to apply the styles without transition immediately
                 indicator.offsetHeight;
                 indicator.style.transition = origTransition;
             } else {
@@ -1152,7 +1147,7 @@
         const MP4_EPOCH_OFFSET = 2082844800;
         let originalMediaDate = null;
         let originalFileLastModified = null;
-        // iOS 解码器对齐守卫：首次播放前强制 seek 确认，防止 iOS 从激活播放遭留的解码器缓存位置（而非 currentTime）开始播放
+        // iOS 解码器对齐守卫
         let firstPlayLock = false;
 
         const fileInput = document.querySelector("#fileInput");
@@ -1171,52 +1166,16 @@
         langOptZh.onclick = () => setLang('zh');
         langOptEn.onclick = () => setLang('en');
 
-        // --- Rendering & Compute Initialization ---
+        // --- Rendering Initialization ---
         const cvs = document.querySelector("#videoCanvas");
         const gl = cvs.getContext('webgl2', { alpha: false, antialias: false, depth: false });
 
         // Feature detection
         const supportsWebCodecs = ("VideoEncoder" in window) && ("VideoDecoder" in window);
-        const supportsWebGPU = ("gpu" in navigator);
 
         if (!gl) {
-            // WebGL2 not available – we will fall back to 2D canvas for rendering.
             console.warn('WebGL2 not supported, falling back to 2D canvas');
         }
-
-        // ---------- WebGPU (or fallback) ----------
-        let gpuDevice = null;
-        let computePipeline = null;
-        const initWebGPU = async () => {
-            if (!supportsWebGPU) return false;
-            try {
-                const adapter = await navigator.gpu.requestAdapter();
-                if (!adapter) return false;
-                gpuDevice = await adapter.requestDevice();
-                // Simple compute shader that copies input to output – replace with real pixel ops later.
-                const shaderCode = `
-                @group(0) @binding(0) var src : texture_2d<f32>;
-                @group(0) @binding(1) var dst : texture_2d<f32>;
-                @compute @workgroup_size(8,8)
-                fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-                    if (gid.x >= textureDimensions(src).x || gid.y >= textureDimensions(src).y) { return; }
-                    let color = textureLoad(src, vec2<i32>(gid.xy), 0);
-                    textureStore(dst, vec2<i32>(gid.xy), color);
-                }`;
-                const module = gpuDevice.createShaderModule({ code: shaderCode });
-                // 为管线显式指定布局，使用自动布局模式以兼容当前规范
-                computePipeline = gpuDevice.createComputePipeline({
-                    layout: "auto",
-                    compute: { module, entryPoint: "main" }
-                });
-                return true;
-            } catch (e) {
-                console.warn('WebGPU init failed, will use WebGL2:', e);
-                return false;
-            }
-        };
-        // Fire‑and‑forget initialization (no await needed here)
-        initWebGPU();
 
         // Shaders
         const vsSource = `#version 300 es
@@ -1225,7 +1184,6 @@
         out vec2 v_texCoord;
         void main() {
             gl_Position = a_position;
-            // WebGL texture coordinates origin is bottom-left.
             v_texCoord = vec2(a_texCoord.x, 1.0 - a_texCoord.y);
         }`;
 
@@ -1281,7 +1239,7 @@
         const textTexLoc = gl.getUniformLocation(program, "u_textTex");
         const barRatioLoc = gl.getUniformLocation(program, "u_barRatio");
 
-        // Fullscreen quad
+        // Fullscreen quad Buffers
         const positionBuffer = gl.createBuffer();
         gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
@@ -1293,6 +1251,20 @@
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
             0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0
         ]), gl.STATIC_DRAW);
+
+        // 【性能优化】使用 VAO (Vertex Array Object) 记录顶点属性绑定状态
+        const vao = gl.createVertexArray();
+        gl.bindVertexArray(vao);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.enableVertexAttribArray(positionLoc);
+        gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+        gl.enableVertexAttribArray(texCoordLoc);
+        gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
+
+        gl.bindVertexArray(null); // 解绑 VAO
 
         const videoTexture = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D, videoTexture);
@@ -1306,7 +1278,7 @@
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
 
-        // Offscreen Canvas for Text Rendering (The Atlas)
+        // Offscreen Canvas for Text Rendering
         const textCanvas = document.createElement('canvas');
         const textCtx = textCanvas.getContext('2d');
         let lastRenderedTimeStr = "";
@@ -1316,8 +1288,9 @@
         let cachedCanvasHeight = -1;
         let cachedFontSize = 0;
         let cachedTextWidth = 0;
-        // 布局度量缓存：固定字符串的宽度在字号不变时恒定，避免每帧重复 measureText
         let cachedLayout = null;
+        let cachedSingleDigitWidth = 0; // 【性能优化】单数字宽度缓存
+        let textTextureInitialized = false; // 【性能优化】标记纹理显存是否已初始化
 
         // UI toggles
         const guideHeader = document.querySelector("#guideHeader");
@@ -1385,7 +1358,7 @@
                 0x7472616B, // trak
                 0x6D646961, // mdia
                 0x6D696E66, // minf
-                0x75647461, // udta（防止内嵌时间戳被跳过）
+                0x75647461, // udta
                 0x6D657461  // meta
             ]);
 
@@ -1399,7 +1372,6 @@
                         const version = view.getUint8(offset + 8);
                         const dataOffset = offset + 12;
                         if (version === 0 && dataOffset + 8 <= end) {
-                            // 若时间戳超出 uint32 范围（2036 年后），跳过写入以避免溢出截断
                             if (bigCreationTime <= 0xFFFFFFFFn) {
                                 view.setUint32(dataOffset, Number(bigCreationTime));
                                 view.setUint32(dataOffset + 4, Number(bigCreationTime));
@@ -1427,26 +1399,24 @@
         const updateStatus = (text, isRec = false) => {
             statusText.textContent = text;
             isRec ? statusBadge.classList.add("recording") : statusBadge.classList.remove("recording");
-            // Show reselect button when in a terminal/idle state
             const reselectKeys = ['statusReady', 'statusDone', 'statusNoSupport'];
             const showReselect = reselectKeys.includes(currentStatusKey);
             reselectBtn.style.display = showReselect ? "inline-flex" : "none";
         };
 
-        // Synchronize language and UI elements immediately after functions are ready to prevent flashing
         applyLang(true);
 
         const getBestSupportedCodec = async (type, width, height, bitrate, framerate) => {
             const avcCandidates = [
-                'avc1.640033', // High Profile, Level 5.1 (支持 4K 及高帧率)
-                'avc1.64002a', // High Profile, Level 4.2 (支持 1080p 高帧率)
-                'avc1.4d0033', // Main Profile, Level 5.1
-                'avc1.4d002a', // Main Profile, Level 4.2
-                'avc1.4DE028'  // Main Profile, Level 4.0
+                'avc1.640033',
+                'avc1.64002a',
+                'avc1.4d0033',
+                'avc1.4d002a',
+                'avc1.4DE028'
             ];
             const hevcCandidates = [
-                'hvc1.1.6.L150.B0', // Main Profile, Level 5.0, Main Tier
-                'hvc1.1.6.L120.B0'  // Main Profile, Level 4.0, Main Tier
+                'hvc1.1.6.L150.B0',
+                'hvc1.1.6.L120.B0'
             ];
 
             const candidates = type === 'hevc' ? hevcCandidates : avcCandidates;
@@ -1464,13 +1434,11 @@
                     console.warn(`检测编码格式 ${codec} 出错:`, e);
                 }
             }
-            return candidates[candidates.length - 1]; // 兜底使用最低级别
+            return candidates[candidates.length - 1];
         };
 
         const initRecorder = async (isHEVC = false) => {
-            // ---------- iOS Safari / 非 WebCodecs fallback ----------
             if (!supportsWebCodecs) {
-                // Ensure canvas size matches export resolution (same logic as below)
                 if (vid.videoWidth > EXPORT_MAX_WIDTH) {
                     const scale = EXPORT_MAX_WIDTH / vid.videoWidth;
                     exportWidth = EXPORT_MAX_WIDTH;
@@ -1483,6 +1451,7 @@
                 cvs.height = exportHeight;
                 cachedCanvasWidth = -1;
                 cachedCanvasHeight = -1;
+                textTextureInitialized = false;
 
                 const stream = cvs.captureStream(30);
                 const mime = MediaRecorder.isTypeSupported('video/mp4') ? 'video/mp4' : 'video/webm';
@@ -1499,13 +1468,11 @@
                     setTimeout(() => URL.revokeObjectURL(url), 1000);
                 };
                 mediaRecorder.start();
-                return true; // No need for Mp4Muxer / VideoEncoder
+                return true;
             }
 
-            // ---------- WebCodecs path (original logic) ----------
             if (!window.VideoEncoder) return false;
 
-            // 计算导出分辨率：如果源视频宽度超过 EXPORT_MAX_WIDTH，等比降采样
             if (vid.videoWidth > EXPORT_MAX_WIDTH) {
                 const scale = EXPORT_MAX_WIDTH / vid.videoWidth;
                 exportWidth = EXPORT_MAX_WIDTH;
@@ -1516,11 +1483,11 @@
                 exportHeight = vid.videoHeight;
             }
 
-            // 调整 canvas 大小
             cvs.width = exportWidth;
             cvs.height = exportHeight;
             cachedCanvasWidth = -1;
             cachedCanvasHeight = -1;
+            textTextureInitialized = false;
 
             let encoderCodec = "";
             let muxerCodec = "avc";
@@ -1563,7 +1530,6 @@
             return true;
         };
 
-        // Helper to encode a frame only when WebCodecs encoder is active
         const maybeEncode = (frame) => {
             if (encoder && encoder.state === 'configured') {
                 encoder.encode(frame);
@@ -1583,7 +1549,6 @@
                 frameCount = 0; startRecBtn.disabled = true; stopRecBtn.disabled = false;
                 playPauseBtn.disabled = true; timeSlider.disabled = true;
 
-                // 事件驱动的背压控制：用 Promise 替代 setTimeout 轮询，避免 15ms 空转
                 let pendingFramesCount = 0;
                 let frameProcessedResolve = null;
                 const frameProcessedSignal = () => {
@@ -1595,7 +1560,6 @@
                 updateStatus(t('statusPreparing'), true);
                 const samples = currentParser.getSamples();
 
-                // 帧率容错：如果检测到的 fps 不正常，强行纠正为特斯拉常用的 36fps
                 const activeFps = (fps > 10 && fps < 100) ? fps : 36;
                 const frameDurationUs = Math.round(1000000 / activeFps);
 
@@ -1611,8 +1575,6 @@
                 currentStatusKey = 'statusSynthesizing'; currentStatusArg = null; currentStatusIsRec = true;
                 updateStatus(t('statusSynthesizing'), true);
 
-                // 解码输出回调：直接同步处理，移除 decodeLock 串行链，让 WebCodecs 内部并行调度
-                // drawFrame（GPU 上传）与 encoder.encode（硬件编码）可并行，无需 JS 层串行化
                 let lastUiUpdateTs = 0;
 
                 await new Promise(async (resolve, reject) => {
@@ -1632,11 +1594,9 @@
                                 if (!isRecording) { frame.close(); pendingFramesCount--; frameProcessedSignal(); return; }
                                 const timeSec = frame.timestamp / 1000000;
                                 if (timeSec >= recordingStartTime) {
-                                    // 绘制和编码逻辑
                                     drawFrame(timeSec, frame);
 
                                     if (encoder && encoder.state === 'configured') {
-                                        // 恢复稳定的时间戳算法，解决变速/慢动作问题
                                         const pts = Math.round(frameCount * frameDurationUs);
 
                                         const outFrame = new VideoFrame(cvs, {
@@ -1647,7 +1607,6 @@
                                         outFrame.close();
                                         frameCount++;
 
-                                        // UI 更新限频：最多每 100ms 更新一次，避免阻塞主线程
                                         const now = performance.now();
                                         if (now - lastUiUpdateTs > 100) {
                                             lastUiUpdateTs = now;
@@ -1680,11 +1639,9 @@
                         codedWidth: config.width,
                         codedHeight: config.height,
                         description: config.description,
-                        // 让浏览器自主选择硬件/软件解码路径，避免某些硬件解码器在长时间高负载下状态异常
                         hardwareAcceleration: 'no-preference'
                     });
 
-                    // 零延迟 MessageChannel 宏任务出让器，替代传统的 setTimeout(r, 0)
                     const yieldMacrotask = (() => {
                         const channel = new MessageChannel();
                         const callbacks = [];
@@ -1698,28 +1655,27 @@
                         });
                     })();
 
+                    // 优化后的流水线并行代码（大幅提升合成速度）：
                     for (let i = startIdx; i < samples.length; i++) {
                         if (!isRecording) break;
-                        // 投递前严格等待：上一帧的 output 回调（drawFrame+encode）必须完成，确保 DPB 有空间。
-                        // pendingFramesCount > 0 表示上一帧还在 output 回调中渲染/编码，等待其完成。
-                        while (isRecording && pendingFramesCount > 0) {
-                            await waitForFrameProcessed();
-                        }
-                        // 解码器投递队列背压：decodeQueueSize 阈值降到 2，避免解码器内部缓冲过深。
-                        while (isRecording && decoder.decodeQueueSize > 2) {
+                        
+                        // 允许解码器和编码器保持合理的并行深度 (8帧)
+                        // 不再强制等待 pendingFramesCount === 0，充分利用硬件解码器的 DPB 并发能力
+                        while (isRecording && (decoder.decodeQueueSize > 8 || (encoder && encoder.encodeQueueSize > 8))) {
                             await yieldMacrotask();
                         }
-                        // 编码器队列背压：编码器积压过深时让出，给硬件编码器时间消化
-                        while (isRecording && encoder && encoder.encodeQueueSize > 4) {
-                            await yieldMacrotask();
-                        }
+                        
                         const s = samples[i];
-                        decoder.decode(new EncodedVideoChunk({ type: s.type, timestamp: s.timestamp, duration: s.duration, data: s.data }));
+                        decoder.decode(new EncodedVideoChunk({ 
+                            type: s.type, 
+                            timestamp: s.timestamp, 
+                            duration: s.duration, 
+                            data: s.data 
+                        }));
                     }
 
                     if (isRecording) {
                         await decoder.flush();
-                        // 等待所有 pending 帧处理完成
                         while (pendingFramesCount > 0) {
                             await waitForFrameProcessed();
                         }
@@ -1737,12 +1693,12 @@
                 currentStatusKey = 'statusError'; currentStatusArg = e.message; currentStatusIsRec = false;
                 updateStatus(t('statusError', e.message));
                 isRecording = false;
-                // 恢复视频原始分辨率
                 if (vid) {
                     cvs.width = vid.videoWidth;
                     cvs.height = vid.videoHeight;
                     cachedCanvasWidth = -1;
                     cachedCanvasHeight = -1;
+                    textTextureInitialized = false;
                 }
                 startRecBtn.disabled = false;
                 stopRecBtn.disabled = true;
@@ -1756,7 +1712,6 @@
             currentStatusKey = 'statusExporting'; currentStatusArg = null; currentStatusIsRec = false;
             updateStatus(t('statusExporting'));
             if (encoder && encoder.state !== 'closed') {
-                // 超时保护：防止 flush 在高分辨率帧积压时永远挂起
                 try {
                     await Promise.race([
                         encoder.flush(),
@@ -1776,18 +1731,18 @@
                 const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
                 setTimeout(() => { URL.revokeObjectURL(url); currentStatusKey = 'statusDone'; currentStatusArg = null; currentStatusIsRec = false; updateStatus(t('statusDone')); }, 1000);
             }
-            // 恢复视频原始分辨率
             if (vid) {
                 cvs.width = vid.videoWidth;
                 cvs.height = vid.videoHeight;
                 cachedCanvasWidth = -1;
                 cachedCanvasHeight = -1;
+                textTextureInitialized = false;
             }
             startRecBtn.disabled = false; stopRecBtn.disabled = true;
             playPauseBtn.disabled = false; timeSlider.disabled = false;
         };
 
-        // --- Core WebGL Render Loop ---
+        // --- Optimized WebGL Render Loop ---
         const drawFrame = (forcedTime = null, sourceFrame = null) => {
             const source = sourceFrame || vid;
             if (!source || (!sourceFrame && source.readyState < 2)) return;
@@ -1815,7 +1770,6 @@
                 }
                 cachedFontSize = fontSize;
 
-                // 优化：textCanvas 仅保留底栏水印高度，大幅降低纹理传输开销
                 const bgH = Math.ceil(cachedFontSize * 2);
                 textCanvas.width = cvs.width;
                 textCanvas.height = bgH;
@@ -1824,7 +1778,9 @@
                 textCtx.textBaseline = 'middle';
                 cachedTextWidth = textCtx.measureText(testString).width;
 
-                // 一次性预计算所有固定字符串的宽度，避免每帧重复 measureText
+                // 【性能优化】测量并缓存单数字宽度（利用 monospace 等宽特性，不再在热点循环中 measureText）
+                cachedSingleDigitWidth = textCtx.measureText("0").width;
+
                 cachedLayout = {
                     apSlotW: textCtx.measureText("AP:AUTO").width,
                     brakeSlotW: textCtx.measureText("Brake:OFF").width,
@@ -1832,13 +1788,13 @@
                     accelLabelW: textCtx.measureText("Accel:").width,
                     accelUnit: "%",
                     accelUnitW: textCtx.measureText("%").width,
-                    accelDigit2W: textCtx.measureText("00").width,
-                    digitSlotW: textCtx.measureText("000").width,
+                    accelDigit2W: cachedSingleDigitWidth * 2,
+                    digitSlotW: cachedSingleDigitWidth * 3,
                     unitStr: " km/h",
                     unitW: textCtx.measureText(" km/h").width
                 };
 
-                // Force texture update flag
+                textTextureInitialized = false;
                 lastRenderedTimeStr = "";
             }
 
@@ -1871,11 +1827,10 @@
                     apText = `AP:${apState}`;
 
                     seiText = `${speedVal}|${accelVal}|${brakeText}|${apText}`;
-
                 }
             }
 
-            // 3. Update Text Texture ONLY if strings changed (Diffing update)
+            // 3. Update Text Texture ONLY if strings changed
             if (timeStr !== lastRenderedTimeStr || seiText !== lastRenderedSeiStr) {
                 const bgH = textCanvas.height;
                 textCtx.clearRect(0, 0, textCanvas.width, bgH);
@@ -1884,7 +1839,6 @@
                 const innerLeft = pad;
                 const innerRight = cvs.width - pad;
 
-                // Draw unified opaque dark grey background across whole bottom width
                 textCtx.fillStyle = '#1a1a1a';
                 textCtx.fillRect(0, 0, cvs.width, bgH);
 
@@ -1892,26 +1846,22 @@
                 const centerY = bgH * 0.5;
                 const seiGap = cachedFontSize * 1.75;
 
-                // 1. Date/Time (Left aligned)
+                // 1. Date/Time
                 textCtx.textAlign = 'left';
                 textCtx.fillText(timeStr, innerLeft, centerY);
 
-                // --- Right-Aligned Cluster Logic ---
-                // 复用缓存的固定字符串宽度，避免每帧重复 measureText
                 const L = cachedLayout;
                 const apSlotW = L.apSlotW;
                 const brakeSlotW = L.brakeSlotW;
                 const accelLabel = L.accelLabel;
                 const accelUnit = L.accelUnit;
                 const accelDigit2W = L.accelDigit2W;
-                // Use fixed 2-digit width for overall layout calculation to lock Accel: position
                 const accelSlotW = L.accelLabelW + accelDigit2W + L.accelUnitW;
                 const digitSlotW = L.digitSlotW;
                 const unitStr = L.unitStr;
                 const unitW = L.unitW;
                 const speedSlotW = digitSlotW + unitW;
 
-                // Calculate fixed starting X positions for each column (Right to Left)
                 const apX = innerRight - apSlotW;
                 const brakeX = apX - seiGap - brakeSlotW;
                 const accelX = brakeX - seiGap - accelSlotW;
@@ -1922,23 +1872,22 @@
                 // 2. AP Status
                 textCtx.fillText(apText, apX, centerY);
 
-                // 3. Brake Status (Left-anchored in its slot)
+                // 3. Brake Status
                 textCtx.fillText(brakeText, brakeX, centerY);
 
                 // 4. Accelerator Position
                 textCtx.fillText(accelLabel, accelX, centerY);
                 const accelLabelW = L.accelLabelW;
 
-                // Dynamic offset for digits end point: pushes % right if > 2 digits
-                const accelValW = textCtx.measureText(accelVal).width;
+                // 【性能优化】使用 cachedSingleDigitWidth 替代 textCtx.measureText(accelVal)
+                const accelValW = accelVal.length * cachedSingleDigitWidth;
                 const xDigitEnd = accelX + accelLabelW + Math.max(accelDigit2W, accelValW);
 
                 textCtx.fillText(accelUnit, xDigitEnd, centerY);
-                // Digits (Right-aligned to the dynamic end point)
                 textCtx.textAlign = 'right';
                 textCtx.fillText(accelVal, xDigitEnd, centerY);
 
-                // 5. Speed (Anchored Unit Logic)
+                // 5. Speed
                 textCtx.textAlign = 'left';
                 textCtx.fillText(unitStr, speedX + digitSlotW, centerY);
                 textCtx.textAlign = 'right';
@@ -1947,29 +1896,29 @@
                 lastRenderedTimeStr = timeStr;
                 lastRenderedSeiStr = seiText;
 
-                // Upload to WebGL Text Texture
+                // 【性能优化】使用 texSubImage2D 避免显存重新分配抖动
                 gl.activeTexture(gl.TEXTURE1);
                 gl.bindTexture(gl.TEXTURE_2D, textTexture);
-                gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // No flip here, managed by shader
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textCanvas);
+                gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+
+                if (!textTextureInitialized) {
+                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textCanvas);
+                    textTextureInitialized = true;
+                } else {
+                    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, textCanvas);
+                }
             }
 
             // 4. Upload Video Frame to GPU
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, videoTexture);
-            // ZERO-COPY upload for VideoFrame
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
 
             // 5. Render WebGL Composite
             gl.useProgram(program);
-
-            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-            gl.enableVertexAttribArray(positionLoc);
-            gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
-
-            gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
-            gl.enableVertexAttribArray(texCoordLoc);
-            gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
+            
+            // 【性能优化】使用预绑定的 VAO
+            gl.bindVertexArray(vao);
 
             gl.uniform1i(videoTexLoc, 0);
             gl.uniform1i(textTexLoc, 1);
@@ -1977,16 +1926,10 @@
             gl.uniform1f(barRatioLoc, barRatio);
 
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            gl.bindVertexArray(null);
+
             if (isRecording) {
-                // 录制时用 flush()（非阻塞）提交 GPU 命令，保证 canvas 有"已完成帧"供 VideoFrame(cvs) 捕获。
-                // flush 只提交命令到 GPU 队列、不阻塞 CPU 等待完成，性能开销极小；
-                // 但能避免 GPU 命令积压时 VideoFrame(cvs) 抛出 "Canvas has no frame"。
                 gl.flush();
-            }
-            // ---------- WebGPU compute placeholder ----------
-            if (supportsWebGPU && gpuDevice) {
-                // TODO: Upload canvas texture to GPU, run compute shader, write back.
-                // This placeholder ensures the code path exists; actual shader logic to be implemented.
             }
 
             if (!dragging && forcedTime === null) {
@@ -1999,19 +1942,15 @@
         let lastVidTimeUpdate = 0;
 
         const render = () => {
-            // 外部直接调用 render() 时（如 onseeked、visibilitychange），取消旧的 rAF 调度以防双重排队
-            // 注意：在 rAF 回调内部调用时，此处的 cancelAnimationFrame 是无效操作（ID 已被消耗），但不影响流程
             if (animationId) cancelAnimationFrame(animationId);
             if (!vid || isRecording) {
                 animationId = null;
                 return;
             }
 
-            // 增强修复：看门狗逻辑 - 检测视频是否在播放但进度卡死
             const now = Date.now();
             if (!vid.paused && !document.hidden) {
                 if (vid.currentTime === lastVidTime) {
-                    // 如果视频处于播放状态但进度停顿超过 500ms，触发强制微调
                     if (now - lastVidTimeUpdate > 500) {
                         vid.currentTime += 0.005;
                         lastVidTimeUpdate = now;
@@ -2022,25 +1961,20 @@
                     lastVidTimeUpdate = now;
                 }
             } else {
-                lastVidTime = -1; // 暂停或不可见时重置
+                lastVidTime = -1;
             }
 
             drawFrame();
-            // 只有在未暂停且未录制时才继续下一帧渲染
             animationId = (!vid.paused && !isRecording) ? requestAnimationFrame(render) : null;
         };
 
-        // 核心修复：切换标签页/后台导致视频管线挂起或 rAF 停止
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) return;
             if (vid && !isRecording) {
                 if (!vid.paused) {
-                    // 1. 尝试显式恢复播放，防止浏览器静默暂停
                     vid.play().catch(() => { });
-                    // 2. 核心补救：无论 readyState 状态，统一执行微调（Nudge）以激活解码器
                     vid.currentTime += 0.005;
                 }
-                // 3. 重置监测时间并触发一次循环
                 lastVidTimeUpdate = Date.now();
                 render();
             }
@@ -2051,11 +1985,10 @@
             const isVideo = file.type.startsWith('video/') || file.name.match(/\.(mp4|mov|m4v)$/i);
             if (!isVideo) return;
 
-            // --- 重置全局解析状态，防止旧视频干扰 ---
             videoStartTime = 0;
             parsedFrames = [];
             currentParser = null;
-            firstPlayLock = true; // 重置首次播放守卫，新视频需要解码器对齐
+            firstPlayLock = true;
             if (vid) {
                 vid.pause();
                 if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
@@ -2064,6 +1997,7 @@
             syncPlayButton(true);
             fps = 36;
             cachedCanvasWidth = -1; cachedCanvasHeight = -1;
+            textTextureInitialized = false;
 
             videoViewer.style.display = "block"; dropZone.style.display = "none";
             currentStatusKey = 'statusParsing'; currentStatusArg = null; currentStatusIsRec = false;
@@ -2090,9 +2024,6 @@
                         const totalVideoBytes = samples.reduce((sum, s) => sum + s.data.length, 0);
                         const durationSec = totalDurationMs / 1000;
                         const originalBitrate = Math.round((totalVideoBytes * 8) / durationSec);
-                        // 优化码率策略：高分辨率导出（≤1920 宽）需要充足的码率来保留行车记录仪画面细节（如车牌）
-                        // 避免按像素面积等比缩水导致画质下降。我们将导出码率设为原始码率的 80% - 100%（根据降采样比例）
-                        // 同时限制码率范围在 5 Mbps 至 15 Mbps 之间
                         const exportW = Math.min(config.width, EXPORT_MAX_WIDTH);
                         const scaleRatio = exportW / config.width;
                         const retentionRatio = scaleRatio < 1.0 ? Math.max(0.8, scaleRatio) : 1.0;
@@ -2102,30 +2033,26 @@
                     }
                 } catch (e) { targetBitrate = 5000000; }
 
-                // --- 逻辑优化：重新平衡时间源优先级 ---
                 const firstSei = parsedFrames.find(f => f.sei)?.sei;
                 const mp4CreationTime = currentParser.getCreationTime();
                 let timeBaseSource = "fallback";
 
-                // 1. 优先尝试从 SEI 中提取最精准的各种时间戳
                 if (firstSei && firstSei.frameSeqNo) {
                     const seq = Number(firstSei.frameSeqNo);
-                    if (seq > 1000000000000) {  // 毫秒级时间戳 (毫秒 > 2001年)
+                    if (seq > 1000000000000) {
                         videoStartTime = seq;
                         timeBaseSource = "SEI 毫秒级时间戳";
-                    } else if (seq > 1000000000) { // 秒级时间戳
+                    } else if (seq > 1000000000) {
                         videoStartTime = seq * 1000;
                         timeBaseSource = "SEI 秒级时间戳";
                     }
                 }
 
-                // 2. 如果 SEI 不含有效时间戳，则寻找文件名日期
                 if (!videoStartTime && dateMatch) {
                     videoStartTime = new Date(`${dateMatch[1].replace(/-/g, '/')} ${dateMatch[2].replace(/-/g, ':')}`).getTime();
                     timeBaseSource = "文件名日期";
                 }
 
-                // 3. 兜底方案：MP4 头部创建时间 -> 文件最后修改时间 -> 当前时间
                 if (!videoStartTime) {
                     if (mp4CreationTime) {
                         videoStartTime = mp4CreationTime;
@@ -2149,41 +2076,33 @@
             let isReady = false;
             let dimensionsSet = false;
             let wxBridgeHandler = null;
-            // 归位 seek 进行中标记：seek 完成前（onseeked 触发前），阻止任何并发事件提前将 isReady 置为 true
             let isSeeking = false;
 
             const onReady = () => {
                 if (nextVid.readyState < 1 && !nextVid.videoWidth) return;
 
-                // 1. 同步视频尺寸（仅执行一次）
                 if (!dimensionsSet && nextVid.videoWidth) {
                     cvs.width = nextVid.videoWidth;
                     cvs.height = nextVid.videoHeight;
                     cachedCanvasWidth = -1;
                     cachedCanvasHeight = -1;
+                    textTextureInitialized = false;
                     dimensionsSet = true;
                 }
 
                 if (isReady) return;
 
-                // 2. 归位 seek 进行中（Guard D 触发后），必须等待 onseeked 确认到位才能继续
-                // 防止 oncanplay、onprogress、onpause 等并发事件在 seek 未完成时抢先 set isReady
                 if (isSeeking) return;
 
-                // 3. 核心逻辑：确保 iOS 自动激活后能够正确回到开头
-                // 如果视频正在进行 tryActivate 的激活播放，等待其暂停后再进行就绪判定
                 if (!nextVid.paused) return;
 
-                // 4. 针对 iOS 的自动播放导致的进度偏移进行强制回跳
-                // 如果当前进度明显偏离开头（如激活时播放了超过 0.1s），则强制归位到 0
                 if (nextVid.currentTime > 0.1) {
-                    nextVid.pause();    // 先暂停，消除 Guard C 的竞态
-                    isSeeking = true;   // 加锁：只有 onseeked 可以解锁，阻断其他并发事件
-                    nextVid.currentTime = 0; // seek 到 0，比 0.001 对 iOS keyframe snap 更健壮
-                    return; // 等待 onseeked 触发，届时 isSeeking=false 后再次进入 onReady
+                    nextVid.pause();
+                    isSeeking = true;
+                    nextVid.currentTime = 0;
+                    return;
                 }
 
-                // 4. 到这里才认为初始化真正完成
                 isReady = true;
                 if (wxBridgeHandler) {
                     document.removeEventListener('WeixinJSBridgeReady', wxBridgeHandler);
@@ -2194,11 +2113,9 @@
                 currentStatusKey = 'statusReady'; currentStatusArg = null; currentStatusIsRec = false;
                 updateStatus(t('statusReady'));
 
-                // 5. 进行一次初始渲染，展示预览帧
                 render();
             };
 
-            // 监听关键事件来触发就绪逻辑
             nextVid.onloadedmetadata = onReady;
             nextVid.oncanplay = onReady;
             nextVid.onprogress = () => { if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady(); };
@@ -2209,18 +2126,15 @@
             };
             nextVid.onpause = () => {
                 syncPlayButton(true);
-                onReady(); // 激活过程中的 pause 会触发此逻辑进行进度归位
+                onReady();
             };
             nextVid.onseeked = () => {
-                // seek 完成：解锁 isSeeking，使 onReady 得以继续执行就绪判定
-                // 注意：isReady=true 之后用户拖动进度条触发的 onseeked 同样走此路径，isSeeking=false 是幂等操作
                 isSeeking = false;
                 onReady();
                 if (nextVid.paused) render();
             };
             nextVid.onended = () => { syncPlayButton(true); animationId = null; };
 
-            // Nudge 逻辑：防止部分浏览器解码管线假死
             const handleStall = () => { if (!nextVid.paused && !isRecording) nextVid.currentTime += 0.005; };
             nextVid.onwaiting = handleStall;
             nextVid.onstalled = handleStall;
@@ -2237,10 +2151,8 @@
                     const p = nextVid.play();
                     if (p) {
                         p.then(() => {
-                            // 激活成功后立即暂停，这将触发 onpause -> onReady() -> 进度重置
                             nextVid.pause();
                         }).catch(() => {
-                            // 如果自动播放被拒绝，只要有基础数据也尝试标记就绪
                             if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady();
                         });
                     }
@@ -2249,7 +2161,6 @@
 
             tryActivate();
             if (typeof WeixinJSBridge !== 'undefined') {
-                // 适配微信内环境
                 WeixinJSBridge.invoke('getNetworkType', {}, () => tryActivate(true));
             }
             wxBridgeHandler = () => tryActivate(true);
@@ -2270,12 +2181,6 @@
                     if (animationId === null) animationId = requestAnimationFrame(render);
                 };
 
-                // iOS 解码器对齐修复：首次在起始位置附近播放时，先强制 seek 到 0.001 并等待 onseeked，再调用 play()
-                // 原理：iOS 视频元素的“呼现位置”（currentTime=0）与内部“解码器位置”可能不同步；
-                // tryActivate 激活循环结束后，解码器可能仍缓存在激活播放的断点，
-                // 不经此对齐直接调用 play() 会导致 iOS 从解码器缓存位置而非 currentTime 开始播放。
-                // 使用 0.001 而非 0：初始化 seek 到了 0，再次 seek to 0 在 iOS 上会被视为 no-op 而不触发 onseeked；
-                // 而 0.001 是与 0 不同的位置，能必然触发 onseeked，从而强制解码器对齐。
                 if (firstPlayLock && vid.currentTime < 1.0) {
                     firstPlayLock = false;
                     let resolved = false;
@@ -2286,8 +2191,7 @@
                         doPlay();
                     };
                     vid.addEventListener('seeked', resolvePlay, { once: true });
-                    vid.currentTime = 0.001; // 非零点 seek 必然触发 onseeked，强制 iOS 解码器对齐到起始帧
-                    // 兆底：极少数情况下 onseeked 不触发（如解码器重置异常），200ms 后强制播放
+                    vid.currentTime = 0.001;
                     setTimeout(resolvePlay, 200);
                 } else {
                     doPlay();

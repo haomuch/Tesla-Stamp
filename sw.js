@@ -4,16 +4,19 @@ const ASSETS_TO_CACHE = [
   './manifest.json',
   './icon.png',
   './public/mp4-muxer.min.js',
-  './public/protobuf.min.js',
-  './public/dashcam-mp4.js',
-  './public/dashcam.proto'
+  './public/protobuf.min.js'
 ];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
-      console.log('Caching mandatory assets');
-      return cache.addAll(ASSETS_TO_CACHE);
+      console.log('Caching assets...');
+      // 使用 map + Promise.allSettled 确保单个资源失败不影响整体安装
+      return Promise.allSettled(
+        ASSETS_TO_CACHE.map(url => {
+          return cache.add(url).catch(err => console.warn(`Failed to cache ${url}:`, err));
+        })
+      );
     })
   );
   self.skipWaiting();

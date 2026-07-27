@@ -35,6 +35,84 @@
                 this._samples = null;
                 this.isHEVC = false;
                 this._reusableSeiBuf = new Uint8Array(65536);
+                this.sourceFile = null;
+                this._sampleDataCache = new Map();
+                this._chunkCache = new Map();
+                this._chunkSize = 4 * 1024 * 1024;
+            }
+
+            attachSource(source) {
+                if (source instanceof File || source instanceof Blob) {
+                    this.sourceFile = source;
+                    this._chunkCache.clear();
+                }
+            }
+
+            async readChunkData(chunkIndex) {
+                if (!this.sourceFile) return null;
+                if (this._chunkCache.has(chunkIndex)) {
+                    return this._chunkCache.get(chunkIndex);
+                }
+
+                try {
+                    const start = chunkIndex * this._chunkSize;
+                    const end = start + this._chunkSize;
+                    const chunk = await this.sourceFile.slice(start, end).arrayBuffer();
+                    const data = new Uint8Array(chunk);
+                    this._chunkCache.set(chunkIndex, data);
+                    if (this._chunkCache.size > 3) {
+                        const firstKey = this._chunkCache.keys().next().value;
+                        this._chunkCache.delete(firstKey);
+                    }
+                    return data;
+                } catch (error) {
+                    console.warn('Chunked sample read failed, falling back to in-memory buffer:', error);
+                    return null;
+                }
+            }
+
+            async readSampleData(offset, size) {
+                if (!this.sourceFile) {
+                    return this.buffer.subarray(offset, offset + size);
+                }
+
+                const key = `${offset}:${size}`;
+                if (this._sampleDataCache.has(key)) {
+                    return this._sampleDataCache.get(key);
+                }
+
+                const result = [];
+                let cursor = offset;
+                let remaining = size;
+
+                while (remaining > 0) {
+                    const chunkIndex = Math.floor(cursor / this._chunkSize);
+                    const chunkStart = chunkIndex * this._chunkSize;
+                    const chunkData = await this.readChunkData(chunkIndex);
+                    if (!chunkData) {
+                        return this.buffer.subarray(offset, offset + size);
+                    }
+
+                    const chunkOffset = cursor - chunkStart;
+                    const toCopy = Math.min(remaining, chunkData.length - chunkOffset);
+                    if (toCopy <= 0) break;
+                    result.push(chunkData.subarray(chunkOffset, chunkOffset + toCopy));
+                    cursor += toCopy;
+                    remaining -= toCopy;
+                }
+
+                const merged = new Uint8Array(size);
+                let written = 0;
+                for (const part of result) {
+                    merged.set(part, written);
+                    written += part.length;
+                }
+                this._sampleDataCache.set(key, merged);
+                if (this._sampleDataCache.size > 16) {
+                    const firstKey = this._sampleDataCache.keys().next().value;
+                    this._sampleDataCache.delete(firstKey);
+                }
+                return merged;
             }
 
             findBox(start, end, name) {
@@ -233,16 +311,9 @@
                             size,
                             timestamp: Math.round(currentTimeUs + ptsOffsetUs),
                             duration: Math.round(durationMs * 1000),
-                            type: keyframes.has(currentSample) ? 'key' : 'delta',
-                            _buffer: this.buffer
+                            type: keyframes.has(currentSample) ? 'key' : 'delta'
                         };
-                        Object.defineProperty(sampleObj, 'data', {
-                            get() {
-                                return new Uint8Array(this._buffer.subarray(this.offset, this.offset + this.size));
-                            },
-                            configurable: true,
-                            enumerable: true
-                        });
+                        sampleObj.loadData = async () => this.readSampleData(sampleObj.offset, sampleObj.size);
                         samples.push(sampleObj);
 
                         offset += size;
@@ -1658,19 +1729,20 @@
                     // 优化后的流水线并行代码（大幅提升合成速度）：
                     for (let i = startIdx; i < samples.length; i++) {
                         if (!isRecording) break;
-                        
+
                         // 允许解码器和编码器保持合理的并行深度 (8帧)
                         // 不再强制等待 pendingFramesCount === 0，充分利用硬件解码器的 DPB 并发能力
                         while (isRecording && (decoder.decodeQueueSize > 8 || (encoder && encoder.encodeQueueSize > 8))) {
                             await yieldMacrotask();
                         }
-                        
+
                         const s = samples[i];
-                        decoder.decode(new EncodedVideoChunk({ 
-                            type: s.type, 
-                            timestamp: s.timestamp, 
-                            duration: s.duration, 
-                            data: s.data 
+                        const sampleData = await s.loadData();
+                        decoder.decode(new EncodedVideoChunk({
+                            type: s.type,
+                            timestamp: s.timestamp,
+                            duration: s.duration,
+                            data: sampleData
                         }));
                     }
 
@@ -1916,7 +1988,7 @@
 
             // 5. Render WebGL Composite
             gl.useProgram(program);
-            
+
             // 【性能优化】使用预绑定的 VAO
             gl.bindVertexArray(vao);
 
@@ -2013,6 +2085,7 @@
                 const protobufData = await DashcamHelpers.initProtobuf();
                 enumFields = protobufData.enumFields;
                 currentParser = new DashcamMP4(buffer);
+                currentParser.attachSource(file);
                 parsedFrames = currentParser.parseFrames(protobufData.SeiMetadata);
 
                 try {
@@ -2021,7 +2094,7 @@
                         const totalDurationMs = config.durations.reduce((a, b) => a + b, 0);
                         if (totalDurationMs > 0) fps = Math.round(config.durations.length / (totalDurationMs / 1000));
                         const samples = currentParser.getSamples();
-                        const totalVideoBytes = samples.reduce((sum, s) => sum + s.data.length, 0);
+                        const totalVideoBytes = samples.reduce((sum, s) => sum + s.size, 0);
                         const durationSec = totalDurationMs / 1000;
                         const originalBitrate = Math.round((totalVideoBytes * 8) / durationSec);
                         const exportW = Math.min(config.width, EXPORT_MAX_WIDTH);

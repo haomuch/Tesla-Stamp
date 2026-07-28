@@ -1380,6 +1380,10 @@
         let isRecording = false;
         let animationId = null;
         let currentVideoUrl = null;
+        let compositeWidth = 0;
+        let compositeHeight = 0;
+        let compositeBarHeight = 0;
+        let compositeSplitBelow = false;
 
         let parsedFrames = [];
         let enumFields = null;
@@ -1412,6 +1416,28 @@
         const formatDate = (date) => {
             const pad = (n) => n.toString().padStart(2, '0');
             return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+        };
+
+        const getInfoBarHeight = (width) => Math.max(36, Math.ceil(width / 40 * 2));
+        const getCompositeLayout = (videoWidth, videoHeight) => {
+            const splitBelow = (videoWidth / videoHeight) > 1.5;
+            const barHeight = getInfoBarHeight(videoWidth);
+            return {
+                width: videoWidth,
+                height: splitBelow ? videoHeight + barHeight : videoHeight,
+                splitBelow,
+                barHeight
+            };
+        };
+        const getScaledCompositeLayout = (videoWidth, videoHeight, maxWidth) => {
+            const base = getCompositeLayout(videoWidth, videoHeight);
+            const scale = maxWidth > 0 && base.width > maxWidth ? maxWidth / base.width : 1;
+            return {
+                width: Math.round(base.width * scale),
+                height: Math.round(base.height * scale),
+                splitBelow: base.splitBelow,
+                barHeight: Math.max(36, Math.round(base.barHeight * scale))
+            };
         };
 
         const syncPlayButton = (isPaused) => {
@@ -1510,14 +1536,11 @@
 
         const initRecorder = async (isHEVC = false) => {
             if (!supportsWebCodecs) {
-                if (vid.videoWidth > EXPORT_MAX_WIDTH) {
-                    const scale = EXPORT_MAX_WIDTH / vid.videoWidth;
-                    exportWidth = EXPORT_MAX_WIDTH;
-                    exportHeight = Math.round(vid.videoHeight * scale) & ~1;
-                } else {
-                    exportWidth = vid.videoWidth;
-                    exportHeight = vid.videoHeight;
-                }
+                const layout = getScaledCompositeLayout(vid.videoWidth, vid.videoHeight, EXPORT_MAX_WIDTH);
+                exportWidth = layout.width;
+                exportHeight = layout.height;
+                compositeSplitBelow = layout.splitBelow;
+                compositeBarHeight = layout.barHeight;
                 cvs.width = exportWidth;
                 cvs.height = exportHeight;
                 cachedCanvasWidth = -1;
@@ -1544,15 +1567,12 @@
 
             if (!window.VideoEncoder) return false;
 
-            if (vid.videoWidth > EXPORT_MAX_WIDTH) {
-                const scale = EXPORT_MAX_WIDTH / vid.videoWidth;
-                exportWidth = EXPORT_MAX_WIDTH;
-                exportHeight = Math.round(vid.videoHeight * scale) & ~1;
-                console.log(`导出直接降采样：${vid.videoWidth}×${vid.videoHeight} → ${exportWidth}×${exportHeight}`);
-            } else {
-                exportWidth = vid.videoWidth;
-                exportHeight = vid.videoHeight;
-            }
+            const layout = getScaledCompositeLayout(vid.videoWidth, vid.videoHeight, EXPORT_MAX_WIDTH);
+            exportWidth = layout.width;
+            exportHeight = layout.height;
+            compositeSplitBelow = layout.splitBelow;
+            compositeBarHeight = layout.barHeight;
+            console.log(`导出直接降采样：${vid.videoWidth}×${vid.videoHeight} → ${exportWidth}×${exportHeight}`);
 
             cvs.width = exportWidth;
             cvs.height = exportHeight;
@@ -1766,8 +1786,11 @@
                 updateStatus(t('statusError', e.message));
                 isRecording = false;
                 if (vid) {
-                    cvs.width = vid.videoWidth;
-                    cvs.height = vid.videoHeight;
+                    const layout = getCompositeLayout(vid.videoWidth, vid.videoHeight);
+                    cvs.width = layout.width;
+                    cvs.height = layout.height;
+                    compositeSplitBelow = layout.splitBelow;
+                    compositeBarHeight = layout.barHeight;
                     cachedCanvasWidth = -1;
                     cachedCanvasHeight = -1;
                     textTextureInitialized = false;
@@ -1804,8 +1827,11 @@
                 setTimeout(() => { URL.revokeObjectURL(url); currentStatusKey = 'statusDone'; currentStatusArg = null; currentStatusIsRec = false; updateStatus(t('statusDone')); }, 1000);
             }
             if (vid) {
-                cvs.width = vid.videoWidth;
-                cvs.height = vid.videoHeight;
+                const layout = getCompositeLayout(vid.videoWidth, vid.videoHeight);
+                cvs.width = layout.width;
+                cvs.height = layout.height;
+                compositeSplitBelow = layout.splitBelow;
+                compositeBarHeight = layout.barHeight;
                 cachedCanvasWidth = -1;
                 cachedCanvasHeight = -1;
                 textTextureInitialized = false;
@@ -1845,6 +1871,9 @@
                 const bgH = Math.ceil(cachedFontSize * 2);
                 textCanvas.width = cvs.width;
                 textCanvas.height = bgH;
+                compositeWidth = cvs.width;
+                compositeHeight = cvs.height;
+                compositeBarHeight = bgH;
 
                 textCtx.font = `400 ${fontSize}px ${fontStack}`;
                 textCtx.textBaseline = 'middle';
@@ -1994,10 +2023,23 @@
 
             gl.uniform1i(videoTexLoc, 0);
             gl.uniform1i(textTexLoc, 1);
-            const barRatio = cachedCanvasHeight > 0 ? (textCanvas.height / cachedCanvasHeight) : 0;
-            gl.uniform1f(barRatioLoc, barRatio);
 
-            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            if (compositeSplitBelow) {
+                const videoViewportHeight = Math.max(1, gl.drawingBufferHeight - compositeBarHeight);
+                gl.viewport(0, compositeBarHeight, gl.drawingBufferWidth, videoViewportHeight);
+                gl.uniform1f(barRatioLoc, 0.0);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+                gl.viewport(0, 0, gl.drawingBufferWidth, compositeBarHeight);
+                gl.uniform1f(barRatioLoc, 1.0);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            } else {
+                const barRatio = cachedCanvasHeight > 0 ? (textCanvas.height / cachedCanvasHeight) : 0;
+                gl.uniform1f(barRatioLoc, barRatio);
+                gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            }
+
             gl.bindVertexArray(null);
 
             if (isRecording) {
@@ -2155,8 +2197,13 @@
                 if (nextVid.readyState < 1 && !nextVid.videoWidth) return;
 
                 if (!dimensionsSet && nextVid.videoWidth) {
-                    cvs.width = nextVid.videoWidth;
-                    cvs.height = nextVid.videoHeight;
+                    const layout = getCompositeLayout(nextVid.videoWidth, nextVid.videoHeight);
+                    cvs.width = layout.width;
+                    cvs.height = layout.height;
+                    compositeSplitBelow = layout.splitBelow;
+                    compositeWidth = layout.width;
+                    compositeHeight = layout.height;
+                    compositeBarHeight = layout.barHeight;
                     cachedCanvasWidth = -1;
                     cachedCanvasHeight = -1;
                     textTextureInitialized = false;

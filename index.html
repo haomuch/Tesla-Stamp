@@ -1241,9 +1241,6 @@
         const cvs = document.querySelector("#videoCanvas");
         const gl = cvs.getContext('webgl2', { alpha: false, antialias: false, depth: false });
 
-        // Feature detection
-        const supportsWebCodecs = ("VideoEncoder" in window) && ("VideoDecoder" in window);
-
         if (!gl) {
             console.warn('WebGL2 not supported, falling back to 2D canvas');
         }
@@ -1400,7 +1397,10 @@
                 old.remove();
             }
             const v = document.createElement("video");
-            v.id = "hiddenVideo"; v.muted = true;
+            v.id = "hiddenVideo";
+            v.muted = true;
+            v.preload = "auto";
+            v.playsInline = true;
             v.setAttribute("playsinline", "true");
             v.setAttribute("webkit-playsinline", "true");
             v.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0.01;pointer-events:none;z-index:-1;";
@@ -1491,7 +1491,9 @@
         let exportHeight = 0;
         let onEncoderError = null;
         const EXPORT_MAX_WIDTH = 1920;
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
         const checkCapabilities = () => !!(typeof Mp4Muxer !== 'undefined' && window.VideoEncoder && window.VideoFrame);
+        const supportsWebCodecs = checkCapabilities();
 
         const updateStatus = (text, isRec = false) => {
             statusText.textContent = text;
@@ -1505,33 +1507,57 @@
 
         const getBestSupportedCodec = async (type, width, height, bitrate, framerate) => {
             const avcCandidates = [
-                'avc1.640033',
-                'avc1.64002a',
-                'avc1.4d0033',
-                'avc1.4d002a',
-                'avc1.4DE028'
+                'avc1.64002a', // High Profile Level 4.2 (iOS VideoToolbox 硬件高码率最佳支持)
+                'avc1.640033', // High Profile Level 5.1
+                'avc1.640028', // High Profile Level 4.0
+                'avc1.4d002a', // Main Profile Level 4.2
+                'avc1.4d0028', // Main Profile Level 4.0
+                'avc1.42002a', // Baseline Level 4.2
+                'avc1.420028'
             ];
             const hevcCandidates = [
+                'hvc1.1.6.L120.B0',
                 'hvc1.1.6.L150.B0',
-                'hvc1.1.6.L120.B0'
+                'hvc1.1.6.L93.B0',
+                'sev1.1.6.L120.B0'
             ];
 
             const candidates = type === 'hevc' ? hevcCandidates : avcCandidates;
 
             for (const codec of candidates) {
                 try {
+                    const supportCbr = await VideoEncoder.isConfigSupported({
+                        codec, width, height, bitrate, framerate, bitrateMode: 'constant', hardwareAcceleration: 'prefer-hardware'
+                    });
+                    if (supportCbr.supported) {
+                        console.log(`已选择支持的编码格式(CBR HW): ${codec} (分辨率: ${width}x${height}, 目标码率: ${(bitrate/1000000).toFixed(1)}M)`);
+                        return { codec, bitrateMode: 'constant' };
+                    }
+                } catch (e) {}
+
+                try {
+                    const supportVar = await VideoEncoder.isConfigSupported({
+                        codec, width, height, bitrate, framerate, bitrateMode: 'variable', hardwareAcceleration: 'prefer-hardware'
+                    });
+                    if (supportVar.supported) {
+                        console.log(`已选择支持的编码格式(VBR HW): ${codec} (分辨率: ${width}x${height}, 目标码率: ${(bitrate/1000000).toFixed(1)}M)`);
+                        return { codec, bitrateMode: 'variable' };
+                    }
+                } catch (e) {}
+
+                try {
                     const support = await VideoEncoder.isConfigSupported({
                         codec, width, height, bitrate, framerate
                     });
                     if (support.supported) {
-                        console.log(`已选择支持的编码格式: ${codec} (分辨率: ${width}x${height})`);
-                        return codec;
+                        console.log(`已选择支持的编码格式(默认): ${codec} (分辨率: ${width}x${height}, 目标码率: ${(bitrate/1000000).toFixed(1)}M)`);
+                        return { codec, bitrateMode: 'constant' };
                     }
                 } catch (e) {
                     console.warn(`检测编码格式 ${codec} 出错:`, e);
                 }
             }
-            return candidates[candidates.length - 1];
+            return { codec: candidates[0], bitrateMode: 'constant' };
         };
 
         const initRecorder = async (isHEVC = false) => {
@@ -1549,7 +1575,7 @@
 
                 const stream = cvs.captureStream(30);
                 const mime = MediaRecorder.isTypeSupported('video/mp4') ? 'video/mp4' : 'video/webm';
-                mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+                mediaRecorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: targetBitrate });
                 const chunks = [];
                 mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
                 mediaRecorder.onstop = () => {
@@ -1580,25 +1606,19 @@
             cachedCanvasHeight = -1;
             textTextureInitialized = false;
 
-            let encoderCodec = "";
+            let selected = null;
             let muxerCodec = "avc";
 
             if (isHEVC) {
-                const candidateCodec = await getBestSupportedCodec('hevc', exportWidth, exportHeight, targetBitrate, fps);
-                try {
-                    const support = await VideoEncoder.isConfigSupported({
-                        codec: candidateCodec, width: exportWidth, height: exportHeight,
-                        bitrate: targetBitrate, framerate: fps
-                    });
-                    if (support.supported) {
-                        encoderCodec = candidateCodec;
-                        muxerCodec = "hevc";
-                    }
-                } catch (e) { }
+                const candidate = await getBestSupportedCodec('hevc', exportWidth, exportHeight, targetBitrate, fps);
+                if (candidate && candidate.codec) {
+                    selected = candidate;
+                    muxerCodec = "hevc";
+                }
             }
 
-            if (!encoderCodec) {
-                encoderCodec = await getBestSupportedCodec('avc', exportWidth, exportHeight, targetBitrate, fps);
+            if (!selected || !selected.codec) {
+                selected = await getBestSupportedCodec('avc', exportWidth, exportHeight, targetBitrate, fps);
                 muxerCodec = "avc";
             }
 
@@ -1614,16 +1634,34 @@
                     if (onEncoderError) onEncoderError(e);
                 }
             });
-            encoder.configure({
-                codec: encoderCodec, width: exportWidth, height: exportHeight,
-                bitrate: targetBitrate, framerate: fps
-            });
+
+            const effectiveBitrate = isIOS
+                ? Math.min(Math.round(targetBitrate * 2.0), 25000000)
+                : targetBitrate;
+
+            const encoderConfig = {
+                codec: selected.codec,
+                width: exportWidth,
+                height: exportHeight,
+                bitrate: effectiveBitrate,
+                bitrateMode: isIOS ? 'variable' : (selected.bitrateMode || 'constant'),
+                framerate: fps,
+                hardwareAcceleration: 'prefer-hardware'
+            };
+            if (muxerCodec === 'avc') {
+                encoderConfig.avc = { format: 'avc' };
+            }
+            if (isIOS) {
+                encoderConfig.latencyMode = 'quality';
+            }
+            console.log(`VideoEncoder 配置参数 (isIOS=${isIOS}):`, encoderConfig);
+            encoder.configure(encoderConfig);
             return true;
         };
 
-        const maybeEncode = (frame) => {
+        const maybeEncode = (frame, isKeyFrame = false) => {
             if (encoder && encoder.state === 'configured') {
-                encoder.encode(frame);
+                encoder.encode(frame, isKeyFrame ? { keyFrame: true } : undefined);
             }
         };
 
@@ -1689,12 +1727,18 @@
 
                                     if (encoder && encoder.state === 'configured') {
                                         const pts = Math.round(frameCount * frameDurationUs);
-
-                                        const outFrame = new VideoFrame(cvs, {
+                                        const outFrameOpts = {
                                             timestamp: pts,
                                             duration: frameDurationUs
-                                        });
-                                        maybeEncode(outFrame);
+                                        };
+                                        if (isIOS) {
+                                            outFrameOpts.alpha = 'discard';
+                                        }
+
+                                        const outFrame = new VideoFrame(cvs, outFrameOpts);
+                                        const keyFrameInterval = isIOS ? 10 : Math.max(15, Math.round(activeFps));
+                                        const isKeyFrame = (frameCount === 0) || (frameCount % keyFrameInterval === 0);
+                                        maybeEncode(outFrame, isKeyFrame);
                                         outFrame.close();
                                         frameCount++;
 
@@ -1750,9 +1794,8 @@
                     for (let i = startIdx; i < samples.length; i++) {
                         if (!isRecording) break;
 
-                        // 允许解码器和编码器保持合理的并行深度 (8帧)
-                        // 不再强制等待 pendingFramesCount === 0，充分利用硬件解码器的 DPB 并发能力
-                        while (isRecording && (decoder.decodeQueueSize > 8 || (encoder && encoder.encodeQueueSize > 8))) {
+                        // 精确控制编码队列深度 (2帧)，防止 iOS VideoToolbox 因队列积压而触发降质降码率逻辑
+                        while (isRecording && (decoder.decodeQueueSize > 4 || (encoder && encoder.encodeQueueSize > 2) || pendingFramesCount > 4)) {
                             await yieldMacrotask();
                         }
 
@@ -2511,7 +2554,7 @@
                         const scaleRatio = exportW / config.width;
                         const retentionRatio = scaleRatio < 1.0 ? Math.max(0.8, scaleRatio) : 1.0;
                         const optimalBitrate = Math.round(originalBitrate * retentionRatio);
-                        targetBitrate = Math.max(5000000, Math.min(optimalBitrate, 15000000));
+                        targetBitrate = Math.max(5000000, Math.min(optimalBitrate, 12000000));
                         console.log(`码率计算：原始码率=${(originalBitrate / 1000000).toFixed(2)}M, 导出目标码率=${(targetBitrate / 1000000).toFixed(2)}M`);
                     }
                 } catch (e) { targetBitrate = 5000000; }
@@ -2579,17 +2622,6 @@
                 }
 
                 if (isReady) return;
-
-                if (isSeeking) return;
-
-                if (!nextVid.paused) return;
-
-                if (nextVid.currentTime > 0.1) {
-                    nextVid.pause();
-                    isSeeking = true;
-                    nextVid.currentTime = 0;
-                    return;
-                }
 
                 isReady = true;
                 if (wxBridgeHandler) {

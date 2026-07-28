@@ -1908,6 +1908,9 @@
             let accelVal = "--";
             let brakeText = "Brake:--";
             let apText = "AP:----";
+            let apState = "NONE";
+            let brake = "OFF";
+            let accel = 0;
 
             if (parsedFrames && parsedFrames.length > 0) {
                 const frameIndex = Math.min(Math.floor(currentTime * fps), parsedFrames.length - 1);
@@ -1915,12 +1918,12 @@
                 if (frame && frame.sei) {
                     const sei = frame.sei;
                     const speed = Math.round((sei.vehicleSpeedMps || 0) * 3.6);
-                    let apState = "NONE";
+                    apState = "NONE";
                     if (enumFields && enumFields.autopilotState) {
                         apState = enumFields.autopilotState.valuesById[sei.autopilotState] || "NONE";
                     }
-                    const brake = sei.brakeApplied ? "ON" : "OFF";
-                    const accel = Math.round(sei.acceleratorPedalPosition || 0);
+                    brake = sei.brakeApplied ? "ON" : "OFF";
+                    accel = Math.round(sei.acceleratorPedalPosition || 0);
 
                     speedVal = speed.toString();
                     accelVal = accel.toString();
@@ -1970,13 +1973,20 @@
 
                 textCtx.textAlign = 'left';
 
+                const apColor = apState !== 'NONE' ? '#3b82f6' : '#d1d1d1';
+                const brakeColor = brake === 'ON' ? '#e31937' : '#d1d1d1';
+                const accelColor = Number(accel) > 0 ? '#4ade80' : '#d1d1d1';
+
                 // 2. AP Status
+                textCtx.fillStyle = apColor;
                 textCtx.fillText(apText, apX, centerY);
 
                 // 3. Brake Status
+                textCtx.fillStyle = brakeColor;
                 textCtx.fillText(brakeText, brakeX, centerY);
 
                 // 4. Accelerator Position
+                textCtx.fillStyle = accelColor;
                 textCtx.fillText(accelLabel, accelX, centerY);
                 const accelLabelW = L.accelLabelW;
 
@@ -1989,6 +1999,7 @@
                 textCtx.fillText(accelVal, xDigitEnd, centerY);
 
                 // 5. Speed
+                textCtx.fillStyle = '#d1d1d1';
                 textCtx.textAlign = 'left';
                 textCtx.fillText(unitStr, speedX + digitSlotW, centerY);
                 textCtx.textAlign = 'right';

@@ -2579,17 +2579,15 @@
                         const firstKeySample = samples.find(s => s.type === 'key');
                         if (firstKeySample) {
                             initialPlaybackTime = Math.max(0.001, firstKeySample.timestamp / 1000000);
-                            if (initialPlaybackTime > 0.001) {
-                                console.log(`Detected first keyframe at ${initialPlaybackTime.toFixed(3)}s, will seek to it for display.`);
-                            }
+                            console.log(`Detected first keyframe at ${initialPlaybackTime.toFixed(3)}s, will seek to it for display.`);
                         }
                         if (isIOSDevice()) {
-                            if (initialPlaybackTime < 0.02) {
-                                initialPlaybackTime = 0.5;
-                                previewSeekTarget = 0.5;
-                                console.log('iOS device: using 0.5s fallback preview seek to avoid black first frame.');
+                            if (initialPlaybackTime > 0.02) {
+                                previewSeekTargets = [initialPlaybackTime, 0.5, 1.0, 2.0, 4.0];
+                                console.log(`iOS device: using keyframe seek target ${initialPlaybackTime.toFixed(3)}s with fallback list.`);
                             } else {
-                                previewSeekTarget = initialPlaybackTime;
+                                previewSeekTargets = [0.5, 1.0, 2.0, 4.0];
+                                console.log('iOS device: using fallback seek targets [0.5s, 1.0s, 2.0s, 4.0s] to avoid black first frame.');
                             }
                         }
                     }
@@ -2643,8 +2641,8 @@
             let wxBridgeHandler = null;
             let isSeeking = false;
             let initialPlaybackTime = 0;
-            let previewSeekTarget = -1;
-            let previewSeekDone = false;
+            let previewSeekTargets = [];
+            let previewSeekIndex = 0;
             let primed = false;
 
             const primePlayback = () => {
@@ -2716,12 +2714,14 @@
 
                 if (isSeeking) return;
 
-                if (previewSeekTarget > 0 && !previewSeekDone && Math.abs(nextVid.currentTime - previewSeekTarget) > 0.02) {
-                    if (!nextVid.paused) nextVid.pause();
-                    previewSeekDone = true;
-                    isSeeking = true;
-                    nextVid.currentTime = previewSeekTarget;
-                    return;
+                if (previewSeekIndex < previewSeekTargets.length) {
+                    const target = previewSeekTargets[previewSeekIndex];
+                    if (Math.abs(nextVid.currentTime - target) > 0.02) {
+                        if (!nextVid.paused) nextVid.pause();
+                        isSeeking = true;
+                        nextVid.currentTime = target;
+                        return;
+                    }
                 }
 
                 if (initialPlaybackTime > 0.001 && Math.abs(nextVid.currentTime - initialPlaybackTime) > 0.02) {
@@ -2787,6 +2787,9 @@
             };
             nextVid.onseeked = () => {
                 isSeeking = false;
+                if (previewSeekIndex < previewSeekTargets.length - 1) {
+                    previewSeekIndex += 1;
+                }
                 onReady();
                 if (nextVid.paused) render();
             };

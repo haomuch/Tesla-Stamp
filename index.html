@@ -2583,10 +2583,14 @@
                                 console.log(`Detected first keyframe at ${initialPlaybackTime.toFixed(3)}s, will seek to it for display.`);
                             }
                         }
-                        if (isIOSDevice() && initialPlaybackTime < 0.02) {
-                            initialPlaybackTime = 0.05;
-                            previewSeekTarget = 0.05;
-                            console.log('iOS device: using 0.05s preview seek to avoid black first frame.');
+                        if (isIOSDevice()) {
+                            if (initialPlaybackTime < 0.02) {
+                                initialPlaybackTime = 0.5;
+                                previewSeekTarget = 0.5;
+                                console.log('iOS device: using 0.5s fallback preview seek to avoid black first frame.');
+                            } else {
+                                previewSeekTarget = initialPlaybackTime;
+                            }
                         }
                     }
                 } catch (e) {
@@ -2712,11 +2716,7 @@
 
                 if (isSeeking) return;
 
-                if (!primed) {
-                    primePlayback();
-                }
-
-                if (previewSeekTarget > 0 && !previewSeekDone && Math.abs(nextVid.currentTime - previewSeekTarget) > 0.02 && !isSeeking) {
+                if (previewSeekTarget > 0 && !previewSeekDone && Math.abs(nextVid.currentTime - previewSeekTarget) > 0.02) {
                     if (!nextVid.paused) nextVid.pause();
                     previewSeekDone = true;
                     isSeeking = true;
@@ -2724,7 +2724,7 @@
                     return;
                 }
 
-                if (initialPlaybackTime > 0.001 && Math.abs(nextVid.currentTime - initialPlaybackTime) > 0.02 && !isSeeking) {
+                if (initialPlaybackTime > 0.001 && Math.abs(nextVid.currentTime - initialPlaybackTime) > 0.02) {
                     if (!nextVid.paused) nextVid.pause();
                     isSeeking = true;
                     nextVid.currentTime = initialPlaybackTime;
@@ -2732,7 +2732,7 @@
                 }
 
                 if (nextVid.currentTime > 0.1 && initialPlaybackTime <= 0.001) {
-                    nextVid.pause();
+                    if (!nextVid.paused) nextVid.pause();
                     isSeeking = true;
                     nextVid.currentTime = 0;
                     return;

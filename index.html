@@ -1687,7 +1687,7 @@
 
                 const activeFps = (fps > 10 && fps < 100) ? fps : 36;
                 const frameDurationUs = Math.round(1000000 / activeFps);
-                const keyframeInterval = Math.max(1, Math.round(activeFps / 2));
+                const keyframeInterval = Math.max(1, Math.round(activeFps / 3));
 
                 let startIdx = 0;
                 if (recordingStartTime > 0) {
@@ -2243,7 +2243,7 @@
         // --- Optimized WebGL Render Loop ---
         const drawFrame = (forcedTime = null, sourceFrame = null) => {
             const source = sourceFrame || vid;
-            if (!source || (!sourceFrame && source.readyState < 2)) return;
+            if (!source || (!sourceFrame && source.readyState < 2 && !source.videoWidth)) return;
 
             const currentTime = forcedTime ?? vid.currentTime;
             const fontStack = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
@@ -2583,6 +2583,11 @@
                                 console.log(`Detected first keyframe at ${initialPlaybackTime.toFixed(3)}s, will seek to it for display.`);
                             }
                         }
+                        if (isIOSDevice() && initialPlaybackTime < 0.02) {
+                            initialPlaybackTime = 0.05;
+                            previewSeekTarget = 0.05;
+                            console.log('iOS device: using 0.05s preview seek to avoid black first frame.');
+                        }
                     }
                 } catch (e) {
                     const iosMultiplier = isIOSDevice() ? 1.9 : 1.0;
@@ -2634,6 +2639,57 @@
             let wxBridgeHandler = null;
             let isSeeking = false;
             let initialPlaybackTime = 0;
+            let previewSeekTarget = -1;
+            let previewSeekDone = false;
+            let primed = false;
+
+            const primePlayback = () => {
+                if (primed || nextVid.readyState < 1) return;
+                primed = true;
+                let frameReady = false;
+
+                const finalize = () => {
+                    if (!nextVid.paused) nextVid.pause();
+                    render();
+                    onReady();
+                };
+
+                const onFrameReady = () => {
+                    if (frameReady) return;
+                    frameReady = true;
+                    requestAnimationFrame(() => {
+                        finalize();
+                    });
+                };
+
+                if (typeof nextVid.requestVideoFrameCallback === 'function') {
+                    nextVid.requestVideoFrameCallback(() => {
+                        onFrameReady();
+                    });
+                }
+
+                try {
+                    const attempt = nextVid.play();
+                    if (attempt && typeof attempt.then === 'function') {
+                        attempt.then(() => {
+                            if (!frameReady) {
+                                requestAnimationFrame(() => {
+                                    onFrameReady();
+                                });
+                            }
+                        }).catch(() => {
+                            if (!frameReady) finalize();
+                        });
+                    } else {
+                        requestAnimationFrame(() => {
+                            if (!frameReady) onFrameReady();
+                        });
+                    }
+                } catch (e) {
+                    if (!nextVid.paused) nextVid.pause();
+                    finalize();
+                }
+            };
 
             const onReady = () => {
                 if (nextVid.readyState < 1 && !nextVid.videoWidth) return;
@@ -2656,10 +2712,20 @@
 
                 if (isSeeking) return;
 
-                if (!nextVid.paused) return;
+                if (!primed) {
+                    primePlayback();
+                }
+
+                if (previewSeekTarget > 0 && !previewSeekDone && Math.abs(nextVid.currentTime - previewSeekTarget) > 0.02 && !isSeeking) {
+                    if (!nextVid.paused) nextVid.pause();
+                    previewSeekDone = true;
+                    isSeeking = true;
+                    nextVid.currentTime = previewSeekTarget;
+                    return;
+                }
 
                 if (initialPlaybackTime > 0.001 && Math.abs(nextVid.currentTime - initialPlaybackTime) > 0.02 && !isSeeking) {
-                    nextVid.pause();
+                    if (!nextVid.paused) nextVid.pause();
                     isSeeking = true;
                     nextVid.currentTime = initialPlaybackTime;
                     return;
@@ -2669,6 +2735,27 @@
                     nextVid.pause();
                     isSeeking = true;
                     nextVid.currentTime = 0;
+                    return;
+                }
+
+                if (!primed) {
+                    primePlayback();
+                    return;
+                }
+
+                if (isIOSDevice() && firstPlayLock && nextVid.currentTime < 1.0) {
+                    firstPlayLock = false;
+                    let resolved = false;
+                    const resolveFrame = () => {
+                        if (resolved) return;
+                        resolved = true;
+                        nextVid.removeEventListener('seeked', resolveFrame);
+                        nextVid.pause();
+                        render();
+                    };
+                    nextVid.addEventListener('seeked', resolveFrame, { once: true });
+                    nextVid.currentTime = 0.001;
+                    setTimeout(resolveFrame, 300);
                     return;
                 }
 

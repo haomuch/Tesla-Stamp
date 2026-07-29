@@ -2526,8 +2526,6 @@
             const isVideo = file.type.startsWith('video/') || file.name.match(/\.(mp4|mov|m4v)$/i);
             if (!isVideo) return;
 
-            // 【修复 Bug 1】提前声明 initialPlaybackTime 变量，避免 TDZ 引用错误
-            let initialPlaybackTime = 0;
             videoStartTime = 0;
             parsedFrames = [];
             currentParser = null;
@@ -2576,15 +2574,7 @@
                         const minBitrate = Math.round(5000000 * iosMultiplier);
                         const maxBitrate = Math.round(15000000 * iosMultiplier);
                         targetBitrate = Math.max(minBitrate, Math.min(optimalBitrate, maxBitrate));
-
-                        // 正确寻找第一个 GOP 关键帧 (IDR Frame)
-                        const firstKeySample = samples.find(s => s.type === 'key');
-                        if (firstKeySample) {
-                            initialPlaybackTime = Math.max(0.001, firstKeySample.timestamp / 1000000);
-                            if (initialPlaybackTime > 0.001) {
-                                console.log(`Detected first keyframe at ${initialPlaybackTime.toFixed(3)}s, will seek to it for display.`);
-                            }
-                        }
+                        console.log(`码率计算 [设备=${isIOSDevice() ? 'iOS (系数 1.9x)' : 'Windows/其他 (1.0x)'}]：原始码率=${(originalBitrate / 1000000).toFixed(2)}M, 导出目标码率=${(targetBitrate / 1000000).toFixed(2)}M`);
                     }
                 } catch (e) {
                     const iosMultiplier = isIOSDevice() ? 1.9 : 1.0;
@@ -2659,15 +2649,7 @@
 
                 if (!nextVid.paused) return;
 
-                // 强制 Seek 到解析出来的第一个关键帧，避免从 B/P 帧启动黑屏
-                if (initialPlaybackTime > 0.001 && Math.abs(nextVid.currentTime - initialPlaybackTime) > 0.02 && !isSeeking) {
-                    nextVid.pause();
-                    isSeeking = true;
-                    nextVid.currentTime = initialPlaybackTime;
-                    return;
-                }
-
-                if (nextVid.currentTime > 0.1 && initialPlaybackTime <= 0.001) {
+                if (nextVid.currentTime > 0.1) {
                     nextVid.pause();
                     isSeeking = true;
                     nextVid.currentTime = 0;
@@ -2684,16 +2666,10 @@
                 currentStatusKey = 'statusReady'; currentStatusArg = null; currentStatusIsRec = false;
                 updateStatus(t('statusReady'));
 
-                // 【修复 Bug 2】针对 iOS 设备的解码器唤醒与帧渲染推送
-                if ('requestVideoFrameCallback' in nextVid) {
-                    nextVid.requestVideoFrameCallback(() => render());
-                } else {
-                    render();
-                }
+                render();
             };
 
             nextVid.onloadedmetadata = onReady;
-            nextVid.onloadeddata = onReady;
             nextVid.oncanplay = onReady;
             nextVid.onprogress = () => { if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady(); };
             nextVid.onplay = () => {
@@ -2708,13 +2684,7 @@
             nextVid.onseeked = () => {
                 isSeeking = false;
                 onReady();
-                if (nextVid.paused) {
-                    if ('requestVideoFrameCallback' in nextVid) {
-                        nextVid.requestVideoFrameCallback(() => render());
-                    } else {
-                        render();
-                    }
-                }
+                if (nextVid.paused) render();
             };
             nextVid.onended = () => { syncPlayButton(true); animationId = null; };
 
@@ -2750,7 +2720,7 @@
             document.addEventListener('WeixinJSBridgeReady', wxBridgeHandler, { once: true });
             fileInput.value = "";
         };
-        
+
         fileInput.onchange = (e) => handleFile(e.target.files[0]);
         dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add("active"); };
         dropZone.ondragleave = () => dropZone.classList.remove("active");

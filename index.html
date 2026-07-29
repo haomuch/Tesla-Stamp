@@ -1687,7 +1687,7 @@
 
                 const activeFps = (fps > 10 && fps < 100) ? fps : 36;
                 const frameDurationUs = Math.round(1000000 / activeFps);
-                const keyframeInterval = Math.max(1, Math.round(activeFps / 3));
+                const keyframeInterval = Math.max(1, Math.round(activeFps / 2));
 
                 let startIdx = 0;
                 if (recordingStartTime > 0) {
@@ -2243,7 +2243,7 @@
         // --- Optimized WebGL Render Loop ---
         const drawFrame = (forcedTime = null, sourceFrame = null) => {
             const source = sourceFrame || vid;
-            if (!source || (!sourceFrame && source.readyState < 2 && !source.videoWidth)) return;
+            if (!source || (!sourceFrame && source.readyState < 2)) return;
 
             const currentTime = forcedTime ?? vid.currentTime;
             const fontStack = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
@@ -2526,6 +2526,8 @@
             const isVideo = file.type.startsWith('video/') || file.name.match(/\.(mp4|mov|m4v)$/i);
             if (!isVideo) return;
 
+            // 【修复 Bug 1】提前声明 initialPlaybackTime 变量，避免 TDZ 引用错误
+            let initialPlaybackTime = 0;
             videoStartTime = 0;
             parsedFrames = [];
             currentParser = null;
@@ -2574,20 +2576,13 @@
                         const minBitrate = Math.round(5000000 * iosMultiplier);
                         const maxBitrate = Math.round(15000000 * iosMultiplier);
                         targetBitrate = Math.max(minBitrate, Math.min(optimalBitrate, maxBitrate));
-                        console.log(`码率计算 [设备=${isIOSDevice() ? 'iOS (系数 1.9x)' : 'Windows/其他 (1.0x)'}]：原始码率=${(originalBitrate / 1000000).toFixed(2)}M, 导出目标码率=${(targetBitrate / 1000000).toFixed(2)}M`);
 
+                        // 正确寻找第一个 GOP 关键帧 (IDR Frame)
                         const firstKeySample = samples.find(s => s.type === 'key');
                         if (firstKeySample) {
                             initialPlaybackTime = Math.max(0.001, firstKeySample.timestamp / 1000000);
-                            console.log(`Detected first keyframe at ${initialPlaybackTime.toFixed(3)}s, will seek to it for display.`);
-                        }
-                        if (isIOSDevice()) {
-                            if (initialPlaybackTime > 0.02) {
-                                previewSeekTargets = [initialPlaybackTime, 0.5, 1.0, 2.0, 4.0];
-                                console.log(`iOS device: using keyframe seek target ${initialPlaybackTime.toFixed(3)}s with fallback list.`);
-                            } else {
-                                previewSeekTargets = [0.5, 1.0, 2.0, 4.0];
-                                console.log('iOS device: using fallback seek targets [0.5s, 1.0s, 2.0s, 4.0s] to avoid black first frame.');
+                            if (initialPlaybackTime > 0.001) {
+                                console.log(`Detected first keyframe at ${initialPlaybackTime.toFixed(3)}s, will seek to it for display.`);
                             }
                         }
                     }
@@ -2640,58 +2635,6 @@
             let dimensionsSet = false;
             let wxBridgeHandler = null;
             let isSeeking = false;
-            let initialPlaybackTime = 0;
-            let previewSeekTargets = [];
-            let previewSeekIndex = 0;
-            let primed = false;
-
-            const primePlayback = () => {
-                if (primed || nextVid.readyState < 1) return;
-                primed = true;
-                let frameReady = false;
-
-                const finalize = () => {
-                    if (!nextVid.paused) nextVid.pause();
-                    render();
-                    onReady();
-                };
-
-                const onFrameReady = () => {
-                    if (frameReady) return;
-                    frameReady = true;
-                    requestAnimationFrame(() => {
-                        finalize();
-                    });
-                };
-
-                if (typeof nextVid.requestVideoFrameCallback === 'function') {
-                    nextVid.requestVideoFrameCallback(() => {
-                        onFrameReady();
-                    });
-                }
-
-                try {
-                    const attempt = nextVid.play();
-                    if (attempt && typeof attempt.then === 'function') {
-                        attempt.then(() => {
-                            if (!frameReady) {
-                                requestAnimationFrame(() => {
-                                    onFrameReady();
-                                });
-                            }
-                        }).catch(() => {
-                            if (!frameReady) finalize();
-                        });
-                    } else {
-                        requestAnimationFrame(() => {
-                            if (!frameReady) onFrameReady();
-                        });
-                    }
-                } catch (e) {
-                    if (!nextVid.paused) nextVid.pause();
-                    finalize();
-                }
-            };
 
             const onReady = () => {
                 if (nextVid.readyState < 1 && !nextVid.videoWidth) return;
@@ -2714,48 +2657,20 @@
 
                 if (isSeeking) return;
 
-                if (previewSeekIndex < previewSeekTargets.length) {
-                    const target = previewSeekTargets[previewSeekIndex];
-                    if (Math.abs(nextVid.currentTime - target) > 0.02) {
-                        if (!nextVid.paused) nextVid.pause();
-                        isSeeking = true;
-                        nextVid.currentTime = target;
-                        return;
-                    }
-                }
+                if (!nextVid.paused) return;
 
-                if (initialPlaybackTime > 0.001 && Math.abs(nextVid.currentTime - initialPlaybackTime) > 0.02) {
-                    if (!nextVid.paused) nextVid.pause();
+                // 强制 Seek 到解析出来的第一个关键帧，避免从 B/P 帧启动黑屏
+                if (initialPlaybackTime > 0.001 && Math.abs(nextVid.currentTime - initialPlaybackTime) > 0.02 && !isSeeking) {
+                    nextVid.pause();
                     isSeeking = true;
                     nextVid.currentTime = initialPlaybackTime;
                     return;
                 }
 
                 if (nextVid.currentTime > 0.1 && initialPlaybackTime <= 0.001) {
-                    if (!nextVid.paused) nextVid.pause();
+                    nextVid.pause();
                     isSeeking = true;
                     nextVid.currentTime = 0;
-                    return;
-                }
-
-                if (!primed) {
-                    primePlayback();
-                    return;
-                }
-
-                if (isIOSDevice() && firstPlayLock && nextVid.currentTime < 1.0) {
-                    firstPlayLock = false;
-                    let resolved = false;
-                    const resolveFrame = () => {
-                        if (resolved) return;
-                        resolved = true;
-                        nextVid.removeEventListener('seeked', resolveFrame);
-                        nextVid.pause();
-                        render();
-                    };
-                    nextVid.addEventListener('seeked', resolveFrame, { once: true });
-                    nextVid.currentTime = 0.001;
-                    setTimeout(resolveFrame, 300);
                     return;
                 }
 
@@ -2769,7 +2684,12 @@
                 currentStatusKey = 'statusReady'; currentStatusArg = null; currentStatusIsRec = false;
                 updateStatus(t('statusReady'));
 
-                render();
+                // 【修复 Bug 2】针对 iOS 设备的解码器唤醒与帧渲染推送
+                if ('requestVideoFrameCallback' in nextVid) {
+                    nextVid.requestVideoFrameCallback(() => render());
+                } else {
+                    render();
+                }
             };
 
             nextVid.onloadedmetadata = onReady;
@@ -2787,11 +2707,14 @@
             };
             nextVid.onseeked = () => {
                 isSeeking = false;
-                if (previewSeekIndex < previewSeekTargets.length - 1) {
-                    previewSeekIndex += 1;
-                }
                 onReady();
-                if (nextVid.paused) render();
+                if (nextVid.paused) {
+                    if ('requestVideoFrameCallback' in nextVid) {
+                        nextVid.requestVideoFrameCallback(() => render());
+                    } else {
+                        render();
+                    }
+                }
             };
             nextVid.onended = () => { syncPlayButton(true); animationId = null; };
 
@@ -2827,7 +2750,7 @@
             document.addEventListener('WeixinJSBridgeReady', wxBridgeHandler, { once: true });
             fileInput.value = "";
         };
-
+        
         fileInput.onchange = (e) => handleFile(e.target.files[0]);
         dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add("active"); };
         dropZone.ondragleave = () => dropZone.classList.remove("active");

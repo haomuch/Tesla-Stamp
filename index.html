@@ -2575,6 +2575,14 @@
                         const maxBitrate = Math.round(15000000 * iosMultiplier);
                         targetBitrate = Math.max(minBitrate, Math.min(optimalBitrate, maxBitrate));
                         console.log(`码率计算 [设备=${isIOSDevice() ? 'iOS (系数 1.9x)' : 'Windows/其他 (1.0x)'}]：原始码率=${(originalBitrate / 1000000).toFixed(2)}M, 导出目标码率=${(targetBitrate / 1000000).toFixed(2)}M`);
+
+                        const firstKeySample = samples.find(s => s.type === 'key');
+                        if (firstKeySample) {
+                            initialPlaybackTime = Math.max(0.001, firstKeySample.timestamp / 1000000);
+                            if (initialPlaybackTime > 0.001) {
+                                console.log(`Detected first keyframe at ${initialPlaybackTime.toFixed(3)}s, will seek to it for display.`);
+                            }
+                        }
                     }
                 } catch (e) {
                     const iosMultiplier = isIOSDevice() ? 1.9 : 1.0;
@@ -2625,6 +2633,7 @@
             let dimensionsSet = false;
             let wxBridgeHandler = null;
             let isSeeking = false;
+            let initialPlaybackTime = 0;
 
             const onReady = () => {
                 if (nextVid.readyState < 1 && !nextVid.videoWidth) return;
@@ -2649,7 +2658,14 @@
 
                 if (!nextVid.paused) return;
 
-                if (nextVid.currentTime > 0.1) {
+                if (initialPlaybackTime > 0.001 && Math.abs(nextVid.currentTime - initialPlaybackTime) > 0.02 && !isSeeking) {
+                    nextVid.pause();
+                    isSeeking = true;
+                    nextVid.currentTime = initialPlaybackTime;
+                    return;
+                }
+
+                if (nextVid.currentTime > 0.1 && initialPlaybackTime <= 0.001) {
                     nextVid.pause();
                     isSeeking = true;
                     nextVid.currentTime = 0;
@@ -2670,6 +2686,7 @@
             };
 
             nextVid.onloadedmetadata = onReady;
+            nextVid.onloadeddata = onReady;
             nextVid.oncanplay = onReady;
             nextVid.onprogress = () => { if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady(); };
             nextVid.onplay = () => {

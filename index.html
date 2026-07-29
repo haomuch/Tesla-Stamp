@@ -1425,13 +1425,19 @@
             return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
         };
 
-        const getInfoBarHeight = (width) => Math.max(36, Math.ceil(width / 40 * 2));
+        const makeEvenDimension = (value) => {
+            const rounded = Math.max(2, Math.round(value));
+            return rounded % 2 === 0 ? rounded : rounded + 1;
+        };
+
+        const getInfoBarHeight = (width) => makeEvenDimension(Math.max(36, Math.ceil(width / 40 * 2)));
         const getCompositeLayout = (videoWidth, videoHeight) => {
             const splitBelow = (videoWidth / videoHeight) > 1.5;
             const barHeight = getInfoBarHeight(videoWidth);
+            const compositeHeight = splitBelow ? videoHeight + barHeight : videoHeight;
             return {
-                width: videoWidth,
-                height: splitBelow ? videoHeight + barHeight : videoHeight,
+                width: makeEvenDimension(videoWidth),
+                height: makeEvenDimension(compositeHeight),
                 splitBelow,
                 barHeight
             };
@@ -1440,10 +1446,10 @@
             const base = getCompositeLayout(videoWidth, videoHeight);
             const scale = maxWidth > 0 && base.width > maxWidth ? maxWidth / base.width : 1;
             return {
-                width: Math.round(base.width * scale),
-                height: Math.round(base.height * scale),
+                width: makeEvenDimension(base.width * scale),
+                height: makeEvenDimension(base.height * scale),
                 splitBelow: base.splitBelow,
-                barHeight: Math.max(36, Math.round(base.barHeight * scale))
+                barHeight: makeEvenDimension(base.barHeight * scale)
             };
         };
 
@@ -1754,8 +1760,19 @@
                     })();
 
                     // 优化后的流水线并行代码（大幅提升合成速度）：
+                    let hasSeenKeyFrame = false;
                     for (let i = startIdx; i < samples.length; i++) {
                         if (!isRecording) break;
+
+                        const s = samples[i];
+                        const isKeyFrame = s.type === 'key';
+
+                        // 某些 Tesla 视频可能从 GOP 中间开始，首个采样并不是关键帧。
+                        // 先跳过这些增量帧，直到看到真正的关键帧后再开始解码，避免 WebCodecs 抛出异常。
+                        if (!hasSeenKeyFrame && !isKeyFrame) {
+                            continue;
+                        }
+                        hasSeenKeyFrame = true;
 
                         // 允许解码器和编码器保持合理的并行深度 (8帧)
                         // 不再强制等待 pendingFramesCount === 0，充分利用硬件解码器的 DPB 并发能力
@@ -1763,7 +1780,6 @@
                             await yieldMacrotask();
                         }
 
-                        const s = samples[i];
                         const sampleData = await s.loadData();
                         decoder.decode(new EncodedVideoChunk({
                             type: s.type,

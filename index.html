@@ -1499,7 +1499,7 @@
             patchBoxes(0, buffer.byteLength); return buffer;
         };
 
-        let muxer = null, encoder = null, mediaRecorder = null, frameCount = 0;
+        let muxer = null, encoder = null, mediaRecorder = null, mediaRecorderStopPromise = null, frameCount = 0;
         let exportWidth = 0;
         let exportHeight = 0;
         let onEncoderError = null;
@@ -1561,18 +1561,39 @@
                 textTextureInitialized = false;
 
                 const stream = cvs.captureStream(30);
-                const mime = MediaRecorder.isTypeSupported('video/mp4') ? 'video/mp4' : 'video/webm';
+                const mimeCandidates = [
+                    'video/mp4;codecs="avc1.640028"',
+                    'video/mp4;codecs="avc1.42E01E"',
+                    'video/webm;codecs=vp9',
+                    'video/webm;codecs=vp8',
+                    'video/webm'
+                ];
+                const mime = mimeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || 'video/webm';
+                console.log('MediaRecorder fallback mime:', mime);
                 mediaRecorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: targetBitrate });
                 const chunks = [];
+                mediaRecorderStopPromise = null;
                 mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
                 mediaRecorder.onstop = () => {
                     const blob = new Blob(chunks, { type: mime });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = `${vidName}_stamp.${mime.split('/')[1]}`;
+                    const ext = mime.includes('webm') ? 'webm' : 'mp4';
+                    a.download = `${vidName}_stamp.${ext}`;
                     a.click();
                     setTimeout(() => URL.revokeObjectURL(url), 1000);
+                    if (mediaRecorderStopPromise) {
+                        mediaRecorderStopPromise.resolve();
+                        mediaRecorderStopPromise = null;
+                    }
+                };
+                mediaRecorder.onerror = (event) => {
+                    console.warn('MediaRecorder error:', event);
+                    if (mediaRecorderStopPromise) {
+                        mediaRecorderStopPromise.reject(new Error('MediaRecorder error'));
+                        mediaRecorderStopPromise = null;
+                    }
                 };
                 mediaRecorder.start();
                 return true;
@@ -1634,9 +1655,9 @@
             return true;
         };
 
-        const maybeEncode = (frame) => {
+        const maybeEncode = (frame, options = {}) => {
             if (encoder && encoder.state === 'configured') {
-                encoder.encode(frame);
+                encoder.encode(frame, options);
             }
         };
 
@@ -1666,6 +1687,7 @@
 
                 const activeFps = (fps > 10 && fps < 100) ? fps : 36;
                 const frameDurationUs = Math.round(1000000 / activeFps);
+                const keyframeInterval = Math.max(1, Math.round(activeFps / 2));
 
                 let startIdx = 0;
                 if (recordingStartTime > 0) {
@@ -1702,12 +1724,13 @@
 
                                     if (encoder && encoder.state === 'configured') {
                                         const pts = Math.round(frameCount * frameDurationUs);
+                                        const forceKeyFrame = (frameCount % keyframeInterval) === 0;
 
                                         const outFrame = new VideoFrame(cvs, {
                                             timestamp: pts,
                                             duration: frameDurationUs
                                         });
-                                        maybeEncode(outFrame);
+                                        maybeEncode(outFrame, { keyFrame: forceKeyFrame });
                                         outFrame.close();
                                         frameCount++;
 
@@ -1839,6 +1862,19 @@
                     console.warn('Encoder flush 超时或出错，强制关闭:', e.message);
                 }
                 if (encoder.state !== 'closed') encoder.close();
+            }
+            if (mediaRecorder) {
+                await new Promise((resolve, reject) => {
+                    if (mediaRecorder.state === 'recording') {
+                        mediaRecorderStopPromise = { resolve, reject };
+                        mediaRecorder.stop();
+                    } else {
+                        resolve();
+                    }
+                }).catch((e) => {
+                    console.warn('MediaRecorder stop failed:', e);
+                });
+                mediaRecorder = null;
             }
             if (muxer) {
                 muxer.finalize();

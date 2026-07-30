@@ -28,51 +28,70 @@
          * Parses MP4 files and extracts SEI metadata from Tesla dashcam footage.
          */
         class DashcamMP4 {
-            constructor(buffer) {
-                this.buffer = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-                this.view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
+            /**
+             * @param {Uint8Array|File|Blob} source - Uint8Array for in‑memory data or a File/Blob for large files.
+             */
+            constructor(source) {
+                // 支持三种数据来源：Uint8Array、ArrayBuffer（两者均视为内存模式）或 File/Blob（文件模式）
+                if (source instanceof Uint8Array) {
+                    this.buffer = source;
+                } else if (source instanceof ArrayBuffer) {
+                    this.buffer = new Uint8Array(source);
+                } else {
+                    // 对于 File/Blob，延迟读取，避免一次性占用大量内存
+                    this.buffer = null;
+                    this.sourceFile = source;
+                }
+                // 当拥有内存缓冲区时立即创建 DataView，文件模式下在首次读取时再创建
+                if (this.buffer) {
+                    this.view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
+                } else {
+                    this.view = null;
+                }
                 this._config = null;
                 this._samples = null;
                 this.isHEVC = false;
                 this._reusableSeiBuf = new Uint8Array(65536);
-                this.sourceFile = null;
                 this._sampleDataCache = new Map();
-                this._chunkCache = new Map();
+                // 统一使用 4MiB 的块大小进行分块读取（不再缓存块）
                 this._chunkSize = 4 * 1024 * 1024;
             }
 
+            /**
+             * 为文件/Blob 设置或更换数据源。
+             * 当切换为 Blob 时，释放已持有的内存缓冲区以防止冗余占用。
+             */
             attachSource(source) {
                 if (source instanceof File || source instanceof Blob) {
                     this.sourceFile = source;
-                    this._chunkCache.clear();
+                    // 保留已有的内存缓冲区（如果已经通过构造函数提供），以供后续解析使用
+                    // 仅在没有 buffer 时才保持 view 为 null，后续读取会使用 sourceFile
                 }
             }
 
+            /**
+             * 读取指定范围的数据块（不做块缓存），直接返回 Uint8Array。
+             */
             async readChunkData(chunkIndex) {
                 if (!this.sourceFile) return null;
-                if (this._chunkCache.has(chunkIndex)) {
-                    return this._chunkCache.get(chunkIndex);
-                }
-
+                const start = chunkIndex * this._chunkSize;
+                const end = start + this._chunkSize;
                 try {
-                    const start = chunkIndex * this._chunkSize;
-                    const end = start + this._chunkSize;
                     const chunk = await this.sourceFile.slice(start, end).arrayBuffer();
-                    const data = new Uint8Array(chunk);
-                    this._chunkCache.set(chunkIndex, data);
-                    if (this._chunkCache.size > 3) {
-                        const firstKey = this._chunkCache.keys().next().value;
-                        this._chunkCache.delete(firstKey);
-                    }
-                    return data;
+                    return new Uint8Array(chunk);
                 } catch (error) {
-                    console.warn('Chunked sample read failed, falling back to in-memory buffer:', error);
+                    console.warn('Chunked read failed:', error);
                     return null;
                 }
             }
 
+            /**
+             * 读取任意偏移和长度的样本数据。
+             * 对于 Blob/文件直接一次性读取所需范围，避免多余的块缓存。
+             */
             async readSampleData(offset, size) {
                 if (!this.sourceFile) {
+                    // 内存模式直接切片
                     return this.buffer.subarray(offset, offset + size);
                 }
 
@@ -81,38 +100,21 @@
                     return this._sampleDataCache.get(key);
                 }
 
-                const result = [];
-                let cursor = offset;
-                let remaining = size;
-
-                while (remaining > 0) {
-                    const chunkIndex = Math.floor(cursor / this._chunkSize);
-                    const chunkStart = chunkIndex * this._chunkSize;
-                    const chunkData = await this.readChunkData(chunkIndex);
-                    if (!chunkData) {
-                        return this.buffer.subarray(offset, offset + size);
+                try {
+                    const slice = await this.sourceFile.slice(offset, offset + size).arrayBuffer();
+                    const data = new Uint8Array(slice);
+                    this._sampleDataCache.set(key, data);
+                    // 限制缓存大小，防止无限增长（保留最近 16 条）
+                    if (this._sampleDataCache.size > 16) {
+                        const firstKey = this._sampleDataCache.keys().next().value;
+                        this._sampleDataCache.delete(firstKey);
                     }
-
-                    const chunkOffset = cursor - chunkStart;
-                    const toCopy = Math.min(remaining, chunkData.length - chunkOffset);
-                    if (toCopy <= 0) break;
-                    result.push(chunkData.subarray(chunkOffset, chunkOffset + toCopy));
-                    cursor += toCopy;
-                    remaining -= toCopy;
+                    return data;
+                } catch (error) {
+                    console.warn('Sample read failed, falling back to in‑memory buffer:', error);
+                    // 若读取失败，回退到已有 buffer（如果有）
+                    return this.buffer ? this.buffer.subarray(offset, offset + size) : null;
                 }
-
-                const merged = new Uint8Array(size);
-                let written = 0;
-                for (const part of result) {
-                    merged.set(part, written);
-                    written += part.length;
-                }
-                this._sampleDataCache.set(key, merged);
-                if (this._sampleDataCache.size > 16) {
-                    const firstKey = this._sampleDataCache.keys().next().value;
-                    this._sampleDataCache.delete(firstKey);
-                }
-                return merged;
             }
 
             findBox(start, end, name) {
@@ -341,14 +343,53 @@
                 }
             }
 
+            /**
+             * 解析 SEI 元数据并返回每帧对应的对象。
+             * 为避免对整个 mdat 区域进行线性扫描（O(N)），改为基于已解析的 Sample 索引遍历。
+             * 当拥有完整的内存缓冲区 (`this.buffer`) 时可以同步读取每个 Sample；若仅有文件/Blob（`this.sourceFile`），
+             * 则回退到原始的线性扫描实现，以保持兼容性。
+             */
             parseFrames(SeiMetadata) {
                 const config = this.getConfig(); // 确保 isHEVC 判定已执行
-                const mdat = this.findMdat();
                 const frames = [];
-                let cursor = mdat.offset;
-                const end = mdat.offset + mdat.size;
                 let pendingSei = null;
 
+                // 优化路径：如果已有完整的 Uint8Array（内存模式），使用 Sample 索引直接解析
+                if (this.buffer) {
+                    const samples = this.getSamples();
+                    for (const s of samples) {
+                        const sampleBuf = this.buffer.subarray(s.offset, s.offset + s.size);
+                        const dv = new DataView(sampleBuf.buffer, sampleBuf.byteOffset, sampleBuf.byteLength);
+                        let cursor = 0;
+                        const end = sampleBuf.byteLength;
+                        while (cursor + 4 <= end) {
+                            const len = dv.getUint32(cursor);
+                            cursor += 4;
+                            if (len < 1 || cursor + len > end) break;
+
+                            const nalHeaderByte0 = sampleBuf[cursor];
+                            const type = this.isHEVC ? ((nalHeaderByte0 >> 1) & 0x3F) : (nalHeaderByte0 & 0x1F);
+
+                            if ((!this.isHEVC && type === 6) || (this.isHEVC && type === 39)) {
+                                // SEI NAL
+                                const headerLen = this.isHEVC ? 2 : 1;
+                                const seiData = new Uint8Array(sampleBuf.subarray(cursor + headerLen, cursor + len));
+                                pendingSei = this.decodeSei(seiData, SeiMetadata);
+                            } else if ((!this.isHEVC && type >= 1 && type <= 5) || (this.isHEVC && type <= 31)) {
+                                // VCL Frame
+                                frames.push({ sei: pendingSei });
+                                pendingSei = null;
+                            }
+                            cursor += len;
+                        }
+                    }
+                    return frames;
+                }
+
+                // 回退路径：仍然对整个 mdat 区域进行线性扫描（兼容仅有文件/Blob 的情况）
+                const mdat = this.findMdat();
+                let cursor = mdat.offset;
+                const end = mdat.offset + mdat.size;
                 while (cursor + 4 <= end) {
                     const len = this.view.getUint32(cursor);
                     cursor += 4;
@@ -358,12 +399,11 @@
                     const type = this.isHEVC ? ((nalHeaderByte0 >> 1) & 0x3F) : (nalHeaderByte0 & 0x1F);
 
                     if ((!this.isHEVC && type === 6) || (this.isHEVC && type === 39)) {
-                        // SEI NAL
                         const headerLen = this.isHEVC ? 2 : 1;
-                        const data = new Uint8Array(this.buffer.subarray(cursor + headerLen, cursor + len));
+                        // 使用 DataView 的底层 ArrayBuffer 直接切片，避免依赖 this.buffer（可能为 null）
+                        const data = new Uint8Array(this.view.buffer, this.view.byteOffset + cursor + headerLen, len - headerLen);
                         pendingSei = this.decodeSei(data, SeiMetadata);
                     } else if ((!this.isHEVC && type >= 1 && type <= 5) || (this.isHEVC && type <= 31)) {
-                        // VCL Frame
                         frames.push({ sei: pendingSei });
                         pendingSei = null;
                     }

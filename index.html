@@ -1227,6 +1227,14 @@
         let originalFileLastModified = null;
         // iOS 解码器对齐守卫
         let firstPlayLock = false;
+        // 首个关键帧的时间（秒），用于解决 iOS Safari 首帧非关键帧时黑屏的问题
+        let firstKeyFrameTime = 0;
+        // 反向拖动时的中间 seek 标记：为加速 iOS 反向 seek，先跳到首个关键帧再向前跳；
+        // 期间 onseeked 不触发 render，避免闪现中间帧。
+        let scrubIntermediate = false;
+        // 拖动进度条时的节流间隔（ms），根据视频分辨率动态调整：
+        // >1080p 时解码+WebGL绘制耗时长，降至 20fps 避免积压；≤1080p 保持 60fps。
+        let scrubThrottleMs = 16;
 
         const fileInput = document.querySelector("#fileInput");
         const dropZone = document.querySelector("#dropZone");
@@ -1239,6 +1247,19 @@
         const timeDisplay = document.querySelector("#timeDisplay");
         const videoViewer = document.querySelector("#videoViewer");
         const timeSlider = document.querySelector("#timeSlider");
+        // 进度条时间映射辅助函数：将 slider 值（0-1000）映射到视频播放时间，
+        // 考虑首帧非关键帧的情况（firstKeyFrameTime > 0），
+        // 此时 slider=0 对应 firstKeyFrameTime，避免 iOS Safari seek 到不可解码的位置。
+        const sliderToTime = (sliderVal, duration, fkft) => {
+            const d = duration, f = fkft || 0;
+            return f + (sliderVal / 1000) * (d - f);
+        };
+        const timeToSlider = (time, duration, fkft) => {
+            const d = duration, f = fkft || 0;
+            const eff = d - f;
+            if (eff <= 0) return (time / d) * 1000;
+            return Math.max(0, (time - f) / eff) * 1000;
+        };
         const langOptZh = document.querySelector("#langOptZh");
         const langOptEn = document.querySelector("#langOptEn");
         langOptZh.onclick = () => setLang('zh');
@@ -1386,6 +1407,7 @@
         let videoStartTime = 0;
         let isRecording = false;
         let animationId = null;
+        let playPending = false;
         let currentVideoUrl = null;
         let compositeWidth = 0;
         let compositeHeight = 0;
@@ -1741,7 +1763,7 @@
                                             currentStatusArg = (timeSec - recordingStartTime).toFixed(1);
                                             currentStatusIsRec = true;
                                             statusText.textContent = t('statusSynthesizingProgress', currentStatusArg);
-                                            timeSlider.value = (timeSec / vid.duration) * 1000;
+                                            timeSlider.value = timeToSlider(timeSec, vid.duration, firstKeyFrameTime);
                                             timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
                                         }
                                     }
@@ -2473,10 +2495,6 @@
                 gl.flush();
             }
 
-            if (!dragging && forcedTime === null) {
-                timeSlider.value = (vid.currentTime / vid.duration) * 1000;
-                timeDisplay.textContent = `${formatTime(vid.currentTime)} / ${formatTime(vid.duration)}`;
-            }
         };
 
         let lastVidTime = -1;
@@ -2488,6 +2506,14 @@
                 animationId = null;
                 return;
             }
+
+            // 进度条和时间显示必须在 drawFrame 之前更新：
+            // drawFrame 内部的 WebGL 操作在 iOS Safari 上可能静默失败导致 JS 中断，
+            // 放在前面确保即使 WebGL 异常，滑块和时间也能正常刷新。
+            if (!dragging) {
+                timeSlider.value = timeToSlider(vid.currentTime, vid.duration, firstKeyFrameTime);
+            }
+            timeDisplay.textContent = `${formatTime(vid.currentTime)} / ${formatTime(vid.duration)}`;
 
             const now = Date.now();
             if (!vid.paused && !document.hidden) {
@@ -2506,7 +2532,11 @@
             }
 
             drawFrame();
-            animationId = (!vid.paused && !isRecording) ? requestAnimationFrame(render) : null;
+            // 持续循环直到 vid.paused 为真且没有 pending 的 play 请求。
+            // play() 是异步的，首帧可能 still paused → playPending 保证循环不在此帧死亡。
+            const keepGoing = !vid.paused || playPending;
+            if (!vid.paused) playPending = false;
+            animationId = (!isRecording && keepGoing) ? requestAnimationFrame(render) : null;
         };
 
         document.addEventListener('visibilitychange', () => {
@@ -2530,6 +2560,7 @@
             parsedFrames = [];
             currentParser = null;
             firstPlayLock = true;
+            firstKeyFrameTime = 0;
             if (vid) {
                 vid.pause();
                 if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
@@ -2556,6 +2587,23 @@
                 currentParser = new DashcamMP4(buffer);
                 currentParser.attachSource(file);
                 parsedFrames = currentParser.parseFrames(protobufData.SeiMetadata);
+
+                // 查找首个关键帧时间，解决 iOS Safari 首帧非关键帧时黑屏的问题
+                // 某些视频（如被裁剪过的）开头可能不是关键帧（IDR），
+                // iOS Safari 的 <video> 管线无法独立解码 P/B 帧，导致首帧黑屏。
+                // 通过 MP4 解析器找到首个关键帧的精确时间戳，后续 seek 到该位置即可。
+                try {
+                    const allSamples = currentParser.getSamples();
+                    for (const s of allSamples) {
+                        if (s.type === 'key') {
+                            firstKeyFrameTime = s.timestamp / 1000000;
+                            break;
+                        }
+                    }
+                    if (firstKeyFrameTime > 0.02) {
+                        console.log(`检测到视频首帧非关键帧，首个关键帧位于 ${firstKeyFrameTime.toFixed(3)}s，将 seek 到该位置以避免 iOS Safari 黑屏`);
+                    }
+                } catch (e) { /* 解析失败时保持默认值 0，回退到原有行为 */ }
 
                 try {
                     const config = currentParser.getConfig();
@@ -2640,6 +2688,12 @@
                     cachedCanvasWidth = -1;
                     cachedCanvasHeight = -1;
                     textTextureInitialized = false;
+
+                    // 根据视频分辨率动态调整拖动节流：>1080p 时 seek+WebGL 绘制耗时更长，
+                    // 适当降低更新频率（20fps）避免解码积压；≤1080p 保持 60fps。
+                    const totalPx = nextVid.videoWidth * nextVid.videoHeight;
+                    scrubThrottleMs = totalPx > 2000000 ? 50 : 16;
+
                     dimensionsSet = true;
                 }
 
@@ -2649,10 +2703,19 @@
 
                 if (!nextVid.paused) return;
 
-                if (nextVid.currentTime > 0.1) {
+                // iOS Safari 在视频首帧非关键帧时会出现黑屏：
+                // 当首个关键帧不在 0 附近时（firstKeyFrameTime > 0.02），
+                // seek 到首个关键帧位置而非 0，确保解码器能正确显示画面。
+                // 正常视频（首帧即关键帧）保持原有行为：currentTime > 0.1 时重置到开头。
+                const seekTarget = firstKeyFrameTime > 0.02 ? firstKeyFrameTime : 0;
+                const needsSeek = seekTarget > 0
+                    ? Math.abs(nextVid.currentTime - seekTarget) > 0.05
+                    : nextVid.currentTime > 0.1;
+
+                if (needsSeek) {
                     nextVid.pause();
                     isSeeking = true;
-                    nextVid.currentTime = 0;
+                    nextVid.currentTime = seekTarget;
                     return;
                 }
 
@@ -2683,6 +2746,7 @@
             };
             nextVid.onseeked = () => {
                 isSeeking = false;
+                if (scrubIntermediate) return; // 反向拖动中间跳转，等最终目标再渲染
                 onReady();
                 if (nextVid.paused) render();
             };
@@ -2730,22 +2794,36 @@
             if (!vid || isRecording) return;
             if (vid.paused) {
                 const doPlay = () => {
+                    // 清除可能被 spurious oninput 卡住的 dragging 标志：
+                    // 部分浏览器在 onchange 之后会额外触发一次 oninput，
+                    // 将 dragging 设回 true 且再无 onchange 来复位，导致滑块永久冻结。
+                    dragging = false;
                     vid.play().catch(() => { syncPlayButton(true); });
+                    playPending = true;
                     if (animationId === null) animationId = requestAnimationFrame(render);
                 };
 
                 if (firstPlayLock && vid.currentTime < 1.0) {
                     firstPlayLock = false;
-                    let resolved = false;
-                    const resolvePlay = () => {
-                        if (resolved) return;
-                        resolved = true;
-                        vid.removeEventListener('seeked', resolvePlay);
+                    // iOS Safari 首帧非关键帧时 seek 到首个关键帧位置，避免黑屏；
+                    // 正常视频 seek 到 0.001 触发首帧加载（保持原有行为）。
+                    const targetTime = Math.max(0.001, firstKeyFrameTime);
+                    // 如果已在目标位置附近（onReady 已 seek 完毕），跳过冗余 seek 直接播放，
+                    // 避免 iOS Safari 上额外的 seek→decode 延迟导致短暂画面静止。
+                    if (Math.abs(vid.currentTime - targetTime) < 0.06) {
                         doPlay();
-                    };
-                    vid.addEventListener('seeked', resolvePlay, { once: true });
-                    vid.currentTime = 0.001;
-                    setTimeout(resolvePlay, 200);
+                    } else {
+                        let resolved = false;
+                        const resolvePlay = () => {
+                            if (resolved) return;
+                            resolved = true;
+                            vid.removeEventListener('seeked', resolvePlay);
+                            doPlay();
+                        };
+                        vid.addEventListener('seeked', resolvePlay, { once: true });
+                        vid.currentTime = targetTime;
+                        setTimeout(resolvePlay, 200);
+                    }
                 } else {
                     doPlay();
                 }
@@ -2756,8 +2834,41 @@
         cvs.onclick = togglePlay; playPauseBtn.onclick = togglePlay;
         startRecBtn.onclick = startRecording; stopRecBtn.onclick = stopRecording;
         reselectBtn.onclick = () => fileInput.click();
-        timeSlider.oninput = () => dragging = true;
-        timeSlider.onchange = () => { vid.currentTime = (timeSlider.value / 1000) * vid.duration; dragging = false; render(); };
+        // RAF 时间门控拖动：用 RAF 循环 + 时间间隔门控替代 setTimeout，
+        // 消除固定延迟累积，高分辨率时（50ms 门控）仍然以 RAF 节奏检查，跟手度更高。
+        let scrubTarget = null;
+        let scrubRaf = null;
+        let lastScrubTime = 0;
+        const scrubLoop = () => {
+            scrubRaf = null;
+            if (!dragging || scrubTarget === null) return;
+            const now = performance.now();
+            if (now - lastScrubTime < scrubThrottleMs) {
+                scrubRaf = requestAnimationFrame(scrubLoop);
+                return;
+            }
+            lastScrubTime = now;
+            const target = scrubTarget;
+            scrubTarget = null;
+            vid.currentTime = target;
+            requestAnimationFrame(() => render());
+            if (dragging) scrubRaf = requestAnimationFrame(scrubLoop);
+        };
+        timeSlider.oninput = () => {
+            dragging = true;
+            const previewTime = sliderToTime(timeSlider.value, vid.duration, firstKeyFrameTime);
+            timeDisplay.textContent = `${formatTime(previewTime)} / ${formatTime(vid.duration)}`;
+            scrubTarget = sliderToTime(timeSlider.value, vid.duration, firstKeyFrameTime);
+            if (!scrubRaf) {
+                lastScrubTime = 0; // 每次开始拖动时重置门控，首帧立即响应
+                scrubRaf = requestAnimationFrame(scrubLoop);
+            }
+        };
+        timeSlider.onchange = () => {
+            if (scrubRaf) { cancelAnimationFrame(scrubRaf); scrubRaf = null; }
+            scrubTarget = null;
+            vid.currentTime = sliderToTime(timeSlider.value, vid.duration, firstKeyFrameTime);
+            dragging = false; render(); };
 
         window.onload = () => {
             if (!checkCapabilities()) {

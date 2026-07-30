@@ -1105,7 +1105,7 @@
                 uploadPrompt: '选择原始视频文件',
                 statusWaiting: '等待导入视频...',
                 statusParsing: '正在解析遥测数据...',
-                statusClickPlay: '请点击播放完成加载...',
+                statusLoading: '正在加载视频...',
                 statusReady: '已就绪',
                 statusPreparing: '正在准备...',
                 statusSynthesizing: '正在合成...',
@@ -1129,7 +1129,7 @@
                 uploadPrompt: 'Select Video File',
                 statusWaiting: 'Waiting for video...',
                 statusParsing: 'Parsing telemetry data...',
-                statusClickPlay: 'Tap play to finish loading...',
+                statusLoading: 'Loading video...',
                 statusReady: 'Ready',
                 statusPreparing: 'Preparing...',
                 statusSynthesizing: 'Recording...',
@@ -2666,8 +2666,8 @@
                 if (!videoStartTime) videoStartTime = originalFileLastModified || Date.now();
             }
 
-            currentStatusKey = 'statusClickPlay'; currentStatusArg = null; currentStatusIsRec = false;
-            updateStatus(t('statusClickPlay'));
+            currentStatusKey = 'statusLoading'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusLoading'));
             const nextVid = createFreshVideo();
             let isReady = false;
             let dimensionsSet = false;

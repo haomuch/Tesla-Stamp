@@ -349,65 +349,45 @@
              * 当拥有完整的内存缓冲区 (`this.buffer`) 时可以同步读取每个 Sample；若仅有文件/Blob（`this.sourceFile`），
              * 则回退到原始的线性扫描实现，以保持兼容性。
              */
-            parseFrames(SeiMetadata) {
-                const config = this.getConfig(); // 确保 isHEVC 判定已执行
+            // 统一使用基于 Sample 索引的异步读取方案，避免对整个 mdat 区域进行线性扫描。
+            // 该实现始终遍历已解析的 Sample 列表，并在需要时通过 readSampleData 异步读取对应片段。
+            // 这样即使在仅有 File/Blob（this.buffer 为 null）的模式下，也只会一次性加载单个 Sample，
+            // 大幅降低内存峰值并避免 CPU 长时间阻塞。
+            async parseFrames(SeiMetadata) {
                 const frames = [];
                 let pendingSei = null;
 
-                // 优化路径：如果已有完整的 Uint8Array（内存模式），使用 Sample 索引直接解析
-                if (this.buffer) {
-                    const samples = this.getSamples();
-                    for (const s of samples) {
-                        const sampleBuf = this.buffer.subarray(s.offset, s.offset + s.size);
-                        const dv = new DataView(sampleBuf.buffer, sampleBuf.byteOffset, sampleBuf.byteLength);
-                        let cursor = 0;
-                        const end = sampleBuf.byteLength;
-                        while (cursor + 4 <= end) {
-                            const len = dv.getUint32(cursor);
-                            cursor += 4;
-                            if (len < 1 || cursor + len > end) break;
+                // 统一获取所有 Sample（无论是否已有完整 buffer）
+                const samples = this.getSamples();
+                for (const s of samples) {
+                    // 根据是否已有内存缓冲区决定读取方式
+                    const sampleBuf = this.buffer
+                        ? this.buffer.subarray(s.offset, s.offset + s.size)
+                        : await this.readSampleData(s.offset, s.size);
 
-                            const nalHeaderByte0 = sampleBuf[cursor];
-                            const type = this.isHEVC ? ((nalHeaderByte0 >> 1) & 0x3F) : (nalHeaderByte0 & 0x1F);
+                    const dv = new DataView(sampleBuf.buffer, sampleBuf.byteOffset, sampleBuf.byteLength);
+                    let cursor = 0;
+                    const end = sampleBuf.byteLength;
+                    while (cursor + 4 <= end) {
+                        const len = dv.getUint32(cursor);
+                        cursor += 4;
+                        if (len < 1 || cursor + len > end) break;
 
-                            if ((!this.isHEVC && type === 6) || (this.isHEVC && type === 39)) {
-                                // SEI NAL
-                                const headerLen = this.isHEVC ? 2 : 1;
-                                const seiData = new Uint8Array(sampleBuf.subarray(cursor + headerLen, cursor + len));
-                                pendingSei = this.decodeSei(seiData, SeiMetadata);
-                            } else if ((!this.isHEVC && type >= 1 && type <= 5) || (this.isHEVC && type <= 31)) {
-                                // VCL Frame
-                                frames.push({ sei: pendingSei });
-                                pendingSei = null;
-                            }
-                            cursor += len;
+                        const nalHeaderByte0 = sampleBuf[cursor];
+                        const type = this.isHEVC ? ((nalHeaderByte0 >> 1) & 0x3F) : (nalHeaderByte0 & 0x1F);
+
+                        if ((!this.isHEVC && type === 6) || (this.isHEVC && type === 39)) {
+                            // SEI NAL 单元
+                            const headerLen = this.isHEVC ? 2 : 1;
+                            const seiData = new Uint8Array(sampleBuf.subarray(cursor + headerLen, cursor + len));
+                            pendingSei = this.decodeSei(seiData, SeiMetadata);
+                        } else if ((!this.isHEVC && type >= 1 && type <= 5) || (this.isHEVC && type <= 31)) {
+                            // VCL 帧（关键帧或非关键帧）
+                            frames.push({ sei: pendingSei });
+                            pendingSei = null;
                         }
+                        cursor += len;
                     }
-                    return frames;
-                }
-
-                // 回退路径：仍然对整个 mdat 区域进行线性扫描（兼容仅有文件/Blob 的情况）
-                const mdat = this.findMdat();
-                let cursor = mdat.offset;
-                const end = mdat.offset + mdat.size;
-                while (cursor + 4 <= end) {
-                    const len = this.view.getUint32(cursor);
-                    cursor += 4;
-                    if (len < 1 || cursor + len > this.view.byteLength) break;
-
-                    const nalHeaderByte0 = this.view.getUint8(cursor);
-                    const type = this.isHEVC ? ((nalHeaderByte0 >> 1) & 0x3F) : (nalHeaderByte0 & 0x1F);
-
-                    if ((!this.isHEVC && type === 6) || (this.isHEVC && type === 39)) {
-                        const headerLen = this.isHEVC ? 2 : 1;
-                        // 使用 DataView 的底层 ArrayBuffer 直接切片，避免依赖 this.buffer（可能为 null）
-                        const data = new Uint8Array(this.view.buffer, this.view.byteOffset + cursor + headerLen, len - headerLen);
-                        pendingSei = this.decodeSei(data, SeiMetadata);
-                    } else if ((!this.isHEVC && type >= 1 && type <= 5) || (this.isHEVC && type <= 31)) {
-                        frames.push({ sei: pendingSei });
-                        pendingSei = null;
-                    }
-                    cursor += len;
                 }
                 return frames;
             }
@@ -2626,7 +2606,7 @@
                 enumFields = protobufData.enumFields;
                 currentParser = new DashcamMP4(buffer);
                 currentParser.attachSource(file);
-                parsedFrames = currentParser.parseFrames(protobufData.SeiMetadata);
+                parsedFrames = await currentParser.parseFrames(protobufData.SeiMetadata);
 
                 // 查找首个关键帧时间，解决 iOS Safari 首帧非关键帧时黑屏的问题
                 // 某些视频（如被裁剪过的）开头可能不是关键帧（IDR），

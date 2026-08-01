@@ -1,0 +1,14 @@
+{
+  "name": "tesla-dashcam-stamp",
+  "version": "1.0.0",
+  "description": "Tesla Dashcam Stamp - Tesla dashcam video timestamp editor and SEI metadata parser",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "build": "echo 'No build required'",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

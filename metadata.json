@@ -1,0 +1,8 @@
+{
+  "name": "Tesla Dashcam Stamp",
+  "description": "Tesla dashcam video timestamp editor and SEI metadata parser",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

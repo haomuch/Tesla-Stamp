@@ -1,17 +1,21 @@
-const CACHE_NAME = 'tesla-dashcam-stamp-v1';
+const CACHE_NAME = 'tesla-dashcam-stamp-v2';
 const ASSETS_TO_CACHE = [
   './index.html',
   './manifest.json',
   './icon.png',
+  './public/css/style.css',
   './public/mp4-muxer.min.js',
-  './public/protobuf.min.js'
+  './public/protobuf.min.js',
+  './public/js/mp4-parser.js',
+  './public/js/i18n.js',
+  './public/js/telemetry-renderer.js',
+  './public/js/app.js'
 ];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       console.log('Caching assets...');
-      // 使用 map + Promise.allSettled 确保单个资源失败不影响整体安装
       return Promise.allSettled(
         ASSETS_TO_CACHE.map(url => {
           return cache.add(url).catch(err => console.warn(`Failed to cache ${url}:`, err));
@@ -39,9 +43,6 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  // 采用 "stale-while-revalidate" 策略：
-  // 1. 立即从缓存返回资源（保证极速加载/离线可用）
-  // 2. 同时在后台发起网络请求，更新缓存供下次使用
   event.respondWith(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.match(event.request).then((cachedResponse) => {
@@ -50,7 +51,6 @@ self.addEventListener('fetch', (event) => {
             return networkResponse;
           }
           
-          // 更新缓存
           const responseToCache = networkResponse.clone();
           cache.put(event.request, responseToCache);
           return networkResponse;
@@ -58,7 +58,6 @@ self.addEventListener('fetch', (event) => {
           console.warn('Background fetch failed:', err);
         });
 
-        // 如果有缓存，立即返回缓存，但后台 fetchPromise 仍在运行
         return cachedResponse || fetchPromise;
       });
     })

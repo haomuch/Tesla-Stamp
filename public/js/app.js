@@ -1217,38 +1217,46 @@
                 // Always seek to the correct start position on first play.
                 // Never trust vid.currentTime — on iOS Safari it can drift after import
                 // due to internal media pipeline buffering even while paused.
-                let resolved = false;
-                let seekRetryCount = 0;
-                const MAX_SEEK_RETRIES = 3;
-                const resolvePlay = () => {
-                    if (resolved) return;
-                    // Verify seek actually took effect; on iOS the seeked event may
-                    // fire before the decoder position is actually updated.
-                    if (Math.abs(vid.currentTime - targetTime) > 0.25 && seekRetryCount < MAX_SEEK_RETRIES) {
-                        seekRetryCount++;
-                        vid.currentTime = targetTime;
-                        return;
-                    }
-                    resolved = true;
-                    vid.removeEventListener('seeked', resolvePlay);
-                    // Final safety: force currentTime to target before playing
-                    if (vid.currentTime !== targetTime) {
-                        vid.currentTime = targetTime;
-                    }
+
+                // Fast path: already at target (common case after tryActivate fix).
+                // Avoids waiting for a seeked event that will never fire because
+                // setting currentTime to its current value is a no-op.
+                if (Math.abs(vid.currentTime - targetTime) < 0.1) {
                     doPlay();
-                };
-                vid.addEventListener('seeked', resolvePlay);
-                vid.currentTime = targetTime;
-                // Safety timeout much longer than 200ms — iOS may take 1-2s to complete seek.
-                // If seeked never fires (e.g. video not loaded enough), fall back after 5s.
-                setTimeout(() => {
-                    if (!resolved) {
+                } else {
+                    let resolved = false;
+                    let seekRetryCount = 0;
+                    const MAX_SEEK_RETRIES = 3;
+                    const resolvePlay = () => {
+                        if (resolved) return;
+                        // Verify seek actually took effect; on iOS the seeked event may
+                        // fire before the decoder position is actually updated.
+                        if (Math.abs(vid.currentTime - targetTime) > 0.25 && seekRetryCount < MAX_SEEK_RETRIES) {
+                            seekRetryCount++;
+                            vid.currentTime = targetTime;
+                            return;
+                        }
                         resolved = true;
                         vid.removeEventListener('seeked', resolvePlay);
-                        vid.currentTime = targetTime;
+                        // Final safety: force currentTime to target before playing
+                        if (vid.currentTime !== targetTime) {
+                            vid.currentTime = targetTime;
+                        }
                         doPlay();
-                    }
-                }, 5000);
+                    };
+                    vid.addEventListener('seeked', resolvePlay);
+                    vid.currentTime = targetTime;
+                    // Safety timeout much longer than 200ms — iOS may take 1-2s to complete seek.
+                    // If seeked never fires (e.g. video not loaded enough), fall back after 5s.
+                    setTimeout(() => {
+                        if (!resolved) {
+                            resolved = true;
+                            vid.removeEventListener('seeked', resolvePlay);
+                            vid.currentTime = targetTime;
+                            doPlay();
+                        }
+                    }, 5000);
+                }
             } else {
                 doPlay();
             }

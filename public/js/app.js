@@ -1161,12 +1161,15 @@
             try {
                 if (doLoad) nextVid.load();
                 const p = nextVid.play();
-                if (p) {
+                if (p && typeof p.then === 'function') {
                     p.then(() => {
                         nextVid.pause();
                     }).catch(() => {
                         if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady();
                     });
+                } else {
+                    // Older browser: play() returns undefined, ensure video is paused
+                    setTimeout(() => { nextVid.pause(); }, 100);
                 }
             } catch (e) { }
         };
@@ -1197,7 +1200,7 @@
                 if (animationId === null) animationId = requestAnimationFrame(render);
             };
 
-            if (firstPlayLock && vid.currentTime < 1.0) {
+            if (firstPlayLock) {
                 firstPlayLock = false;
                 const targetTime = Math.max(0.001, firstKeyFrameTime);
                 if (Math.abs(vid.currentTime - targetTime) < 0.06) {
@@ -1262,6 +1265,7 @@
         timeSlider.onchange = () => {
             if (scrubRaf) { cancelAnimationFrame(scrubRaf); scrubRaf = null; }
             scrubTarget = null;
+            firstPlayLock = false;
             vid.currentTime = sliderToTime(timeSlider.value, vid.duration, firstKeyFrameTime);
             dragging = false;
             render();

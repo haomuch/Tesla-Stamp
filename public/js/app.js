@@ -1116,6 +1116,12 @@
                 return;
             }
 
+            // drawFrame() requires readyState >= 2 (HAVE_CURRENT_DATA) to render.
+            // When firstKeyFrameTime=0 (keyframe at frame 0), no seek is needed,
+            // so onReady() may fire from onloadedmetadata (readyState=1) before the
+            // decoder has a frame to display. Wait for oncanplay (readyState>=2).
+            if (nextVid.readyState < 2) return;
+
             isReady = true;
             firstPlayTargetTime = firstKeyFrameTime > 0.02 ? firstKeyFrameTime : 0;
             if (wxBridgeHandler) {

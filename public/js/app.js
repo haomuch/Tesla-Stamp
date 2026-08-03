@@ -20,6 +20,7 @@
     let originalFileLastModified = null;
     let firstPlayLock = false;
     let firstKeyFrameTime = 0;
+    let firstPlayTargetTime = 0;
     let scrubThrottleMs = 16;
 
     // DOM References
@@ -1116,6 +1117,7 @@
             }
 
             isReady = true;
+            firstPlayTargetTime = firstKeyFrameTime > 0.02 ? firstKeyFrameTime : 0;
             if (wxBridgeHandler) {
                 document.removeEventListener('WeixinJSBridgeReady', wxBridgeHandler);
                 wxBridgeHandler = null;
@@ -1160,6 +1162,15 @@
             if (isReady) return;
             try {
                 if (doLoad) nextVid.load();
+                // iOS Safari: calling play() without user gesture rejects but may still trigger
+                // the media pipeline to start buffering/decoding, causing currentTime to drift
+                // even while the video appears paused. Use load()+events only on iOS.
+                if (isIOSDevice()) {
+                    // On iOS, rely purely on loadedmetadata/canplay events for readiness.
+                    // load() is enough to kick off the media pipeline without the play() side effects.
+                    if (doLoad) nextVid.load();
+                    return;
+                }
                 const p = nextVid.play();
                 if (p && typeof p.then === 'function') {
                     p.then(() => {
@@ -1202,21 +1213,42 @@
 
             if (firstPlayLock) {
                 firstPlayLock = false;
-                const targetTime = Math.max(0.001, firstKeyFrameTime);
-                if (Math.abs(vid.currentTime - targetTime) < 0.06) {
+                const targetTime = firstPlayTargetTime || Math.max(0, firstKeyFrameTime);
+                // Always seek to the correct start position on first play.
+                // Never trust vid.currentTime — on iOS Safari it can drift after import
+                // due to internal media pipeline buffering even while paused.
+                let resolved = false;
+                let seekRetryCount = 0;
+                const MAX_SEEK_RETRIES = 3;
+                const resolvePlay = () => {
+                    if (resolved) return;
+                    // Verify seek actually took effect; on iOS the seeked event may
+                    // fire before the decoder position is actually updated.
+                    if (Math.abs(vid.currentTime - targetTime) > 0.25 && seekRetryCount < MAX_SEEK_RETRIES) {
+                        seekRetryCount++;
+                        vid.currentTime = targetTime;
+                        return;
+                    }
+                    resolved = true;
+                    vid.removeEventListener('seeked', resolvePlay);
+                    // Final safety: force currentTime to target before playing
+                    if (vid.currentTime !== targetTime) {
+                        vid.currentTime = targetTime;
+                    }
                     doPlay();
-                } else {
-                    let resolved = false;
-                    const resolvePlay = () => {
-                        if (resolved) return;
+                };
+                vid.addEventListener('seeked', resolvePlay);
+                vid.currentTime = targetTime;
+                // Safety timeout much longer than 200ms — iOS may take 1-2s to complete seek.
+                // If seeked never fires (e.g. video not loaded enough), fall back after 5s.
+                setTimeout(() => {
+                    if (!resolved) {
                         resolved = true;
                         vid.removeEventListener('seeked', resolvePlay);
+                        vid.currentTime = targetTime;
                         doPlay();
-                    };
-                    vid.addEventListener('seeked', resolvePlay, { once: true });
-                    vid.currentTime = targetTime;
-                    setTimeout(resolvePlay, 200);
-                }
+                    }
+                }, 5000);
             } else {
                 doPlay();
             }

@@ -69,7 +69,7 @@ const updateStatus = (text, isRec = false) => {
     const statusText = document.querySelector("#statusText");
     const statusBadge = document.querySelector("#statusBadge");
     const reselectBtn = document.querySelector("#reselectBtn");
-    
+
     if (statusText) statusText.textContent = text;
     if (statusBadge) {
         isRec ? statusBadge.classList.add("recording") : statusBadge.classList.remove("recording");

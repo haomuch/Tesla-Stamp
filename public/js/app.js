@@ -210,6 +210,7 @@
     let parsedFrames = [];
     let enumFields = null;
     let currentParser = null;
+    let eventLocation = null;
     const reusableDate = new Date();
 
     const createFreshVideo = () => {
@@ -276,44 +277,277 @@
             : '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
     };
 
-    const patchMp4Metadata = (buffer, creationTime) => {
-        const view = new DataView(buffer);
-        const bigCreationTime = BigInt(creationTime);
-        const targets = new Set([0x6D766864, 0x746B6864, 0x6D646864]);
-        const containers = new Set([
-            0x6D6F6F76, // moov
-            0x7472616B, // trak
-            0x6D646961, // mdia
-            0x6D696E66, // minf
-            0x75647461, // udta
-            0x6D657461  // meta
-        ]);
+    const transformLat = (x, y) => {
+        let ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+        ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+        ret += (20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin(y / 3.0 * Math.PI)) * 2.0 / 3.0;
+        ret += (160.0 * Math.sin(y / 12.0 * Math.PI) + 320 * Math.sin(y * Math.PI / 30.0)) * 2.0 / 3.0;
+        return ret;
+    };
 
-        const patchBoxes = (start, end) => {
-            let offset = start;
-            while (offset + 8 <= end) {
-                const boxSize = view.getUint32(offset);
-                const boxType = view.getUint32(offset + 4);
-                if (boxSize < 8 || offset + boxSize > end) break;
-                if (targets.has(boxType)) {
-                    const version = view.getUint8(offset + 8);
-                    const dataOffset = offset + 12;
-                    if (version === 0 && dataOffset + 8 <= end) {
-                        if (bigCreationTime <= 0xFFFFFFFFn) {
-                            view.setUint32(dataOffset, Number(bigCreationTime));
-                            view.setUint32(dataOffset + 4, Number(bigCreationTime));
-                        }
-                    } else if (version === 1 && dataOffset + 16 <= end) {
-                        view.setBigUint64(dataOffset, bigCreationTime);
-                        view.setBigUint64(dataOffset + 8, bigCreationTime);
+    const transformLon = (x, y) => {
+        let ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+        ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+        ret += (20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin(x / 3.0 * Math.PI)) * 2.0 / 3.0;
+        ret += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300.0 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0;
+        return ret;
+    };
+
+    const gcj02ToWgs84 = (gcjLat, gcjLon) => {
+        if (gcjLon < 72.004 || gcjLon > 137.8347 || gcjLat < 0.8293 || gcjLat > 55.8271) {
+            return [gcjLat, gcjLon];
+        }
+        const a = 6378245.0;
+        const ee = 0.00669342162296594323;
+        let dLat = transformLat(gcjLon - 105.0, gcjLat - 35.0);
+        let dLon = transformLon(gcjLon - 105.0, gcjLat - 35.0);
+        const radLat = gcjLat / 180.0 * Math.PI;
+        let magic = Math.sin(radLat);
+        magic = 1 - ee * magic * magic;
+        const sqrtMagic = Math.sqrt(magic);
+        dLat = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * Math.PI);
+        dLon = (dLon * 180.0) / (a / sqrtMagic * Math.cos(radLat) * Math.PI);
+        return [gcjLat - dLat, gcjLon - dLon];
+    };
+
+    const formatISO6709 = (lat, lon) => {
+        let latNum = typeof lat === 'number' ? lat : parseFloat(lat);
+        let lonNum = typeof lon === 'number' ? lon : parseFloat(lon);
+        if (isNaN(latNum) || isNaN(lonNum)) return null;
+
+        // Tesla 国内车机 event.json 记录的是国测局 GCJ-02 火星坐标。
+        // iOS 相册读取元数据时默认将其视作 WGS-84 并自动叠加国内高德地图的火星偏转（WGS84 -> GCJ02）。
+        // 因此在此逆向转换为 WGS-84，使 iOS 地图还原时精准落到真实位置，避免 100~200 米的二次加偏。
+        const [wgsLat, wgsLon] = gcj02ToWgs84(latNum, lonNum);
+
+        const latSign = wgsLat >= 0 ? '+' : '-';
+        const lonSign = wgsLon >= 0 ? '+' : '-';
+        const latStr = `${latSign}${Math.abs(wgsLat).toFixed(6)}`;
+        const lonStr = `${lonSign}${Math.abs(wgsLon).toFixed(6)}`;
+        return `${latStr}${lonStr}/`;
+    };
+
+    const buildLocationMetaBox = (isoStr) => {
+        const enc = new TextEncoder();
+        const keyNameBytes = enc.encode('com.apple.quicktime.location.ISO6709');
+        const valBytes = enc.encode(isoStr);
+
+        const dataBoxSize = 16 + valBytes.length;
+        const itemBoxSize = 8 + dataBoxSize;
+        const ilstBoxSize = 8 + itemBoxSize;
+        const keyEntrySize = 8 + keyNameBytes.length;
+        const keysBoxSize = 16 + keyEntrySize;
+        const hdlrBoxSize = 33;
+        // In QuickTime, `meta` is a simple Box with 8-byte header (not a FullBox)
+        const metaBoxSize = 8 + hdlrBoxSize + keysBoxSize + ilstBoxSize;
+
+        const buf = new Uint8Array(metaBoxSize);
+        const view = new DataView(buf.buffer);
+        let o = 0;
+
+        view.setUint32(o, metaBoxSize); o += 4;
+        buf.set(enc.encode('meta'), o); o += 4;
+
+        // hdlr box
+        view.setUint32(o, hdlrBoxSize); o += 4;
+        buf.set(enc.encode('hdlr'), o); o += 4;
+        view.setUint32(o, 0); o += 4; // version 0, flags 0
+        view.setUint32(o, 0); o += 4; // component type / predefined 0
+        buf.set(enc.encode('mdta'), o); o += 4; // component subtype 'mdta'
+        buf.set(enc.encode('appl'), o); o += 4; // component manufacturer 'appl'
+        view.setUint32(o, 0); o += 4; // component flags 0
+        view.setUint32(o, 0); o += 4; // component flags mask 0
+        buf[o] = 0; o += 1; // component name (Pascal string with length 0)
+
+        // keys box (FullBox)
+        view.setUint32(o, keysBoxSize); o += 4;
+        buf.set(enc.encode('keys'), o); o += 4;
+        view.setUint32(o, 0); o += 4; // version 0, flags 0
+        view.setUint32(o, 1); o += 4; // entry count 1
+
+        // key entry 1
+        view.setUint32(o, keyEntrySize); o += 4;
+        buf.set(enc.encode('mdta'), o); o += 4;
+        buf.set(keyNameBytes, o); o += keyNameBytes.length;
+
+        // ilst box
+        view.setUint32(o, ilstBoxSize); o += 4;
+        buf.set(enc.encode('ilst'), o); o += 4;
+
+        // item 1 (index 1)
+        view.setUint32(o, itemBoxSize); o += 4;
+        view.setUint32(o, 1); o += 4; // 1-based index
+
+        // data box
+        view.setUint32(o, dataBoxSize); o += 4;
+        buf.set(enc.encode('data'), o); o += 4;
+        view.setUint32(o, 1); o += 4; // type indicator 1 = UTF-8 text
+        view.setUint32(o, 0); o += 4; // locale 0
+        buf.set(valBytes, o); o += valBytes.length;
+
+        return buf;
+    };
+
+    const buildLocationUdtaBox = (isoStr) => {
+        const enc = new TextEncoder();
+        const valBytes = enc.encode(isoStr);
+
+        const xyzBoxSize = 12 + valBytes.length;
+        const udtaBoxSize = 8 + xyzBoxSize;
+
+        const buf = new Uint8Array(udtaBoxSize);
+        const view = new DataView(buf.buffer);
+        let o = 0;
+
+        view.setUint32(o, udtaBoxSize); o += 4;
+        buf.set(enc.encode('udta'), o); o += 4;
+
+        view.setUint32(o, xyzBoxSize); o += 4;
+        buf[o] = 0xA9; buf[o + 1] = 0x78; buf[o + 2] = 0x79; buf[o + 3] = 0x7A; o += 4;
+        view.setUint16(o, valBytes.length); o += 2;
+        view.setUint16(o, 0x15C7); o += 2;
+        buf.set(valBytes, o); o += valBytes.length;
+
+        return buf;
+    };
+
+    const patchMp4Metadata = (buffer, creationTime, location = null) => {
+        let workBuffer = buffer;
+
+        if (location && location.lat !== undefined && location.lon !== undefined) {
+            const isoStr = formatISO6709(location.lat, location.lon);
+            if (isoStr) {
+                const metaBox = buildLocationMetaBox(isoStr);
+                const udtaBox = buildLocationUdtaBox(isoStr);
+                const extraLength = metaBox.length + udtaBox.length;
+                const extraBytes = new Uint8Array(extraLength);
+                extraBytes.set(metaBox, 0);
+                extraBytes.set(udtaBox, metaBox.length);
+
+                let view = new DataView(workBuffer);
+                let moovInfo = null;
+                let mdatInfo = null;
+
+                let pos = 0;
+                while (pos + 8 <= workBuffer.byteLength) {
+                    let boxSize = view.getUint32(pos);
+                    const boxType = view.getUint32(pos + 4);
+                    let headerSize = 8;
+                    if (boxSize === 1 && pos + 16 <= workBuffer.byteLength) {
+                        const high = view.getUint32(pos + 8);
+                        const low = view.getUint32(pos + 12);
+                        boxSize = Number((BigInt(high) << 32n) | BigInt(low));
+                        headerSize = 16;
+                    } else if (boxSize === 0) {
+                        boxSize = workBuffer.byteLength - pos;
                     }
-                } else if (containers.has(boxType)) {
-                    patchBoxes(offset + 8, offset + boxSize);
+                    if (boxSize < 8 || pos + boxSize > workBuffer.byteLength) break;
+
+                    if (boxType === 0x6D6F6F76) {
+                        moovInfo = { start: pos, end: pos + boxSize, size: boxSize, headerSize };
+                    } else if (boxType === 0x6D646174) {
+                        mdatInfo = { start: pos, size: boxSize };
+                    }
+                    pos += boxSize;
                 }
-                offset += boxSize;
+
+                if (moovInfo) {
+                    const deltaSize = extraLength;
+                    const isMdatAfterMoov = mdatInfo && mdatInfo.start > moovInfo.start;
+
+                    if (isMdatAfterMoov) {
+                        const adjustChunkOffsets = (start, end) => {
+                            let offset = start;
+                            while (offset + 8 <= end) {
+                                const boxSize = view.getUint32(offset);
+                                const boxType = view.getUint32(offset + 4);
+                                if (boxSize < 8 || offset + boxSize > end) break;
+
+                                if (boxType === 0x7374636F) {
+                                    const entryCount = view.getUint32(offset + 12);
+                                    for (let i = 0; i < entryCount; i++) {
+                                        const entryOffset = offset + 16 + i * 4;
+                                        if (entryOffset + 4 <= end) {
+                                            const oldVal = view.getUint32(entryOffset);
+                                            view.setUint32(entryOffset, oldVal + deltaSize);
+                                        }
+                                    }
+                                } else if (boxType === 0x636F3634) {
+                                    const entryCount = view.getUint32(offset + 12);
+                                    for (let i = 0; i < entryCount; i++) {
+                                        const entryOffset = offset + 16 + i * 8;
+                                        if (entryOffset + 8 <= end) {
+                                            const oldVal = view.getBigUint64(entryOffset);
+                                            view.setBigUint64(entryOffset, oldVal + BigInt(deltaSize));
+                                        }
+                                    }
+                                } else if (
+                                    boxType === 0x6D6F6F76 ||
+                                    boxType === 0x7472616B ||
+                                    boxType === 0x6D646961 ||
+                                    boxType === 0x6D696E66 ||
+                                    boxType === 0x7374626C
+                                ) {
+                                    adjustChunkOffsets(offset + 8, offset + boxSize);
+                                }
+                                offset += boxSize;
+                            }
+                        };
+                        adjustChunkOffsets(moovInfo.start + moovInfo.headerSize, moovInfo.end);
+                    }
+
+                    view.setUint32(moovInfo.start, moovInfo.size + deltaSize);
+
+                    const newBuffer = new Uint8Array(workBuffer.byteLength + deltaSize);
+                    newBuffer.set(new Uint8Array(workBuffer, 0, moovInfo.end), 0);
+                    newBuffer.set(extraBytes, moovInfo.end);
+                    newBuffer.set(new Uint8Array(workBuffer, moovInfo.end), moovInfo.end + deltaSize);
+
+                    workBuffer = newBuffer.buffer;
+                }
             }
-        };
-        patchBoxes(0, buffer.byteLength); return buffer;
+        }
+
+        if (creationTime) {
+            const view = new DataView(workBuffer);
+            const bigCreationTime = BigInt(creationTime);
+            const targets = new Set([0x6D766864, 0x746B6864, 0x6D646864]);
+            const containers = new Set([
+                0x6D6F6F76,
+                0x7472616B,
+                0x6D646961,
+                0x6D696E66,
+                0x75647461,
+                0x6D657461
+            ]);
+
+            const patchBoxes = (start, end) => {
+                let offset = start;
+                while (offset + 8 <= end) {
+                    const boxSize = view.getUint32(offset);
+                    const boxType = view.getUint32(offset + 4);
+                    if (boxSize < 8 || offset + boxSize > end) break;
+                    if (targets.has(boxType)) {
+                        const version = view.getUint8(offset + 8);
+                        const dataOffset = offset + 12;
+                        if (version === 0 && dataOffset + 8 <= end) {
+                            if (bigCreationTime <= 0xFFFFFFFFn) {
+                                view.setUint32(dataOffset, Number(bigCreationTime));
+                                view.setUint32(dataOffset + 4, Number(bigCreationTime));
+                            }
+                        } else if (version === 1 && dataOffset + 16 <= end) {
+                            view.setBigUint64(dataOffset, bigCreationTime);
+                            view.setBigUint64(dataOffset + 8, bigCreationTime);
+                        }
+                    } else if (containers.has(boxType)) {
+                        patchBoxes(offset + 8, offset + boxSize);
+                    }
+                    offset += boxSize;
+                }
+            };
+            patchBoxes(0, workBuffer.byteLength);
+        }
+        return workBuffer;
     };
 
     let muxer = null, encoder = null, mediaRecorder = null, mediaRecorderStopPromise = null, frameCount = 0;
@@ -679,7 +913,8 @@
         if (muxer) {
             muxer.finalize();
             const { buffer } = muxer.target;
-            let finalBlob = originalMediaDate ? new Blob([patchMp4Metadata(buffer, originalMediaDate)], { type: 'video/mp4' }) : new Blob([buffer], { type: 'video/mp4' });
+            let finalBuffer = patchMp4Metadata(buffer, originalMediaDate, eventLocation);
+            let finalBlob = new Blob([finalBuffer], { type: 'video/mp4' });
             const file = new File([finalBlob], `${vidName}_stamp.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
             const url = URL.createObjectURL(file);
             const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
@@ -1200,11 +1435,56 @@
         fileInput.value = "";
     };
 
-    if (fileInput) fileInput.onchange = (e) => handleFile(e.target.files[0]);
+    const handleFiles = async (fileList) => {
+        if (!fileList || fileList.length === 0) return;
+
+        let videoFile = null;
+        let jsonFile = null;
+
+        for (let i = 0; i < fileList.length; i++) {
+            const f = fileList[i];
+            const isVideo = f.type.startsWith('video/') || f.name.match(/\.(mp4|mov|m4v)$/i);
+            const isJson = f.name.toLowerCase().endsWith('.json') || f.type === 'application/json';
+            if (isVideo && !videoFile) {
+                videoFile = f;
+            } else if (isJson && !jsonFile) {
+                jsonFile = f;
+            }
+        }
+
+        if (jsonFile) {
+            try {
+                const text = await jsonFile.text();
+                const data = JSON.parse(text);
+                const lat = data.est_lat !== undefined ? data.est_lat : data.latitude;
+                const lon = data.est_lon !== undefined ? data.est_lon : data.longitude;
+                if (lat !== undefined && lon !== undefined && !isNaN(parseFloat(lat)) && !isNaN(parseFloat(lon))) {
+                    eventLocation = {
+                        lat: parseFloat(lat),
+                        lon: parseFloat(lon)
+                    };
+                    console.log("已成功读取 event.json 坐标:", eventLocation);
+                } else {
+                    eventLocation = null;
+                }
+            } catch (e) {
+                console.warn("读取 event.json 失败:", e);
+                eventLocation = null;
+            }
+        } else {
+            eventLocation = null;
+        }
+
+        if (videoFile) {
+            await handleFile(videoFile);
+        }
+    };
+
+    if (fileInput) fileInput.onchange = (e) => handleFiles(e.target.files);
     if (dropZone) {
         dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add("active"); };
         dropZone.ondragleave = () => dropZone.classList.remove("active");
-        dropZone.ondrop = (e) => { e.preventDefault(); dropZone.classList.remove("active"); handleFile(e.dataTransfer.files[0]); };
+        dropZone.ondrop = (e) => { e.preventDefault(); dropZone.classList.remove("active"); handleFiles(e.dataTransfer.files); };
     }
 
     const togglePlay = () => {

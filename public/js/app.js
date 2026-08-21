@@ -40,18 +40,7 @@
     const langOptZh = document.querySelector("#langOptZh");
     const langOptEn = document.querySelector("#langOptEn");
 
-    // Slider time mapping helpers
-    const sliderToTime = (sliderVal, duration, fkft) => {
-        const d = duration, f = fkft || 0;
-        return f + (sliderVal / 1000) * (d - f);
-    };
-    const timeToSlider = (time, duration, fkft) => {
-        const d = duration, f = fkft || 0;
-        const eff = d - f;
-        if (eff <= 0) return (time / d) * 1000;
-        return Math.max(0, (time - f) / eff) * 1000;
-    };
-
+    // Slider 使用全局连续时间轴映射（见 computeMergedTimeline / globalTimeToSlider）
     if (langOptZh) langOptZh.onclick = () => setLang('zh');
     if (langOptEn) langOptEn.onclick = () => setLang('en');
 
@@ -213,6 +202,40 @@
     let eventLocation = null;
     const reusableDate = new Date();
 
+    // 多片段合并状态
+    let clips = [];
+    let currentClipContext = null;
+    let mergeAnalysis = null;
+    let previewClipIndex = 0;
+
+    // 全局连续时间轴（跨段合并进度条用）
+    let mergedOffsets = [0];      // mergedOffsets[i] = 第 i 段起点（秒，相对首段 0）
+    let mergedTotalDuration = 0;  // 全部片段累计时长（秒）
+    let pendingSeekTime = null;   // 切换片段后待定位的局部时间（秒），用于跨段拖动 seek
+    let pendingClipSwitch = null; // 跨段拖动过程中正在切换到的片段索引，避免重复触发 setupPreview
+
+    const computeMergedTimeline = () => {
+        mergedOffsets = [0];
+        let acc = 0;
+        for (const c of clips) { acc += (c.durationMs || 0) / 1000; mergedOffsets.push(acc); }
+        mergedTotalDuration = acc;
+    };
+    const globalTimeToSlider = (gt) => {
+        if (mergedTotalDuration <= 0) return 0;
+        return Math.max(0, Math.min(1, gt / mergedTotalDuration)) * 1000;
+    };
+    const sliderToGlobalTime = (val) => (val / 1000) * mergedTotalDuration;
+    const findClipForGlobalTime = (gt) => {
+        for (let i = 0; i < clips.length; i++) {
+            const start = mergedOffsets[i];
+            const end = mergedOffsets[i + 1];
+            if (gt < end - 1e-6 || i === clips.length - 1) {
+                return { i, localTime: Math.max(0, gt - start) };
+            }
+        }
+        return { i: Math.max(0, clips.length - 1), localTime: 0 };
+    };
+
     const createFreshVideo = () => {
         const old = document.getElementById("hiddenVideo");
         if (old) {
@@ -269,6 +292,17 @@
             splitBelow: base.splitBelow,
             barHeight: makeEvenDimension(base.barHeight * scale)
         };
+    };
+
+    const computeTargetBitrate = (clip) => {
+        const iosMultiplier = isIOSDevice() ? 2.0 : 1.0;
+        const exportW = Math.min(clip.width, EXPORT_MAX_WIDTH);
+        const scaleRatio = exportW / clip.width;
+        const retentionRatio = scaleRatio < 1.0 ? Math.max(0.8, scaleRatio) : 1.0;
+        const optimalBitrate = Math.round(clip.originalBitrate * retentionRatio * iosMultiplier);
+        const minBitrate = Math.round(5000000 * iosMultiplier);
+        const maxBitrate = Math.round(15000000 * iosMultiplier);
+        return Math.max(minBitrate, Math.min(optimalBitrate, maxBitrate));
     };
 
     const syncPlayButton = (isPaused) => {
@@ -589,14 +623,20 @@
         return candidates[candidates.length - 1];
     };
 
-    const initRecorder = async (isHEVC = false) => {
+    const initRecorder = async (isHEVC = false, srcWidth = null, srcHeight = null) => {
         if (!supportsWebCodecs) {
-            const layout = getScaledCompositeLayout(vid.videoWidth, vid.videoHeight, EXPORT_MAX_WIDTH);
+            const layout = getScaledCompositeLayout(
+                srcWidth != null ? srcWidth : (vid ? vid.videoWidth : 0),
+                srcHeight != null ? srcHeight : (vid ? vid.videoHeight : 0),
+                EXPORT_MAX_WIDTH
+            );
             exportWidth = layout.width;
             exportHeight = layout.height;
             compositeSplitBelow = layout.splitBelow;
-            cvs.width = exportWidth;
-            cvs.height = exportHeight;
+            if (cvs.width !== exportWidth || cvs.height !== exportHeight) {
+                cvs.width = exportWidth;
+                cvs.height = exportHeight;
+            }
             cachedCanvasWidth = -1;
             cachedCanvasHeight = -1;
             textTextureInitialized = false;
@@ -642,14 +682,19 @@
 
         if (!window.VideoEncoder) return false;
 
-        const layout = getScaledCompositeLayout(vid.videoWidth, vid.videoHeight, EXPORT_MAX_WIDTH);
+        const inWidth = srcWidth != null ? srcWidth : (vid ? vid.videoWidth : 0);
+        const inHeight = srcHeight != null ? srcHeight : (vid ? vid.videoHeight : 0);
+        const layout = getScaledCompositeLayout(inWidth, inHeight, EXPORT_MAX_WIDTH);
         exportWidth = layout.width;
         exportHeight = layout.height;
         compositeSplitBelow = layout.splitBelow;
-        console.log(`导出直接降采样：${vid.videoWidth}×${vid.videoHeight} → ${exportWidth}×${exportHeight}`);
+        console.log(`导出直接降采样：${inWidth}×${inHeight} → ${exportWidth}×${exportHeight}`);
 
-        cvs.width = exportWidth;
-        cvs.height = exportHeight;
+        // 仅在分辨率变化时重置画布（重置会清空内容）；分辨率不变则保留预览帧，避免合成开头黑屏闪烁
+        if (cvs.width !== exportWidth || cvs.height !== exportHeight) {
+            cvs.width = exportWidth;
+            cvs.height = exportHeight;
+        }
         cachedCanvasWidth = -1;
         cachedCanvasHeight = -1;
         textTextureInitialized = false;
@@ -703,14 +748,48 @@
 
     const startRecording = async () => {
         try {
-            if (!currentParser || !window.VideoDecoder) return;
-            if (vid.currentTime >= vid.duration) vid.currentTime = 0;
+            if (!clips || clips.length === 0 || !window.VideoDecoder) return;
+            const isMerge = clips.length > 1;
+            const refClip = clips[0];
+            if (!isMerge && vid && vid.currentTime >= vid.duration) vid.currentTime = 0;
 
-            const config = currentParser.getConfig();
-            if (!(await initRecorder(config.type === 'hevc'))) return;
+            const isHEVC = refClip.config.codec === 'hevc';
+            if (!(await initRecorder(isHEVC, refClip.config.width, refClip.config.height))) return;
 
-            vid.pause(); isRecording = true;
-            let recordingStartTime = (vid.currentTime < 0.1) ? 0 : vid.currentTime;
+            if (vid) vid.pause();
+
+            // 合成起点：首段预览时允许从当前播放进度开始；但首帧非关键帧的视频在首个
+            // 关键帧之前无法呈现画面（会黑屏），故合成起点不得早于首个关键帧。
+            let recordingStartTime;
+            if (previewClipIndex === 0) {
+                const desired = (vid && vid.currentTime >= 0.1) ? vid.currentTime : 0;
+                recordingStartTime = (firstKeyFrameTime > 0.02) ? Math.max(desired, firstKeyFrameTime) : desired;
+            } else {
+                recordingStartTime = 0;
+            }
+
+            // 预填充画布：用已呈现的当前预览帧铺底，消除解码预热期黑屏闪烁。
+            // 首帧非关键帧时对齐到首个关键帧再绘制，并用 requestVideoFrameCallback 确保
+            // 拿到的是「已呈现」的有效帧，而不是刚 seek 完尚未绘制的黑屏。
+            const prefillTime = recordingStartTime;
+            const drawPrefill = () => {
+                try { if (vid && vid.readyState >= 2 && hasWebGL) drawFrame(prefillTime, vid); } catch (e) { }
+            };
+            if (vid && vid.readyState >= 2 && hasWebGL) {
+                if (vid.currentTime < prefillTime - 0.05) {
+                    if (vid.requestVideoFrameCallback) {
+                        vid.requestVideoFrameCallback(drawPrefill);
+                    } else {
+                        const onSeek = () => { vid.removeEventListener('seeked', onSeek); drawPrefill(); };
+                        vid.addEventListener('seeked', onSeek);
+                    }
+                    vid.currentTime = prefillTime;
+                } else {
+                    drawPrefill();
+                    if (vid.requestVideoFrameCallback) vid.requestVideoFrameCallback(drawPrefill);
+                }
+            }
+            isRecording = true;
             frameCount = 0; startRecBtn.disabled = true; stopRecBtn.disabled = false;
             playPauseBtn.disabled = true; timeSlider.disabled = true;
 
@@ -723,91 +802,19 @@
 
             currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
             updateStatus(t('statusPreparing'), true);
-            const samples = currentParser.getSamples();
 
-            const activeFps = (fps > 10 && fps < 100) ? fps : 36;
+            const activeFps = (refClip.fps > 10 && refClip.fps < 100) ? refClip.fps : 36;
             const frameDurationUs = Math.round(1000000 / activeFps);
             const keyframeInterval = Math.max(1, Math.round(activeFps / 2));
 
-            let startIdx = 0;
-            if (recordingStartTime > 0) {
-                const startTimeUs = recordingStartTime * 1000000;
-                let lastKeyIdx = 0;
-                for (let i = 0; i < samples.length; i++) {
-                    if (samples[i].type === 'key') lastKeyIdx = i;
-                    if (samples[i].timestamp >= startTimeUs) { startIdx = lastKeyIdx; break; }
-                }
-            }
             currentStatusKey = 'statusSynthesizing'; currentStatusArg = null; currentStatusIsRec = true;
             updateStatus(t('statusSynthesizing'), true);
 
             let lastUiUpdateTs = 0;
 
             await new Promise(async (resolve, reject) => {
-                const cleanup = () => {
-                    onEncoderError = null;
-                };
-
-                onEncoderError = (err) => {
-                    cleanup();
-                    reject(err);
-                };
-
-                const decoder = new VideoDecoder({
-                    output: (frame) => {
-                        pendingFramesCount++;
-                        try {
-                            if (!isRecording) { frame.close(); pendingFramesCount--; frameProcessedSignal(); return; }
-                            const timeSec = frame.timestamp / 1000000;
-                            if (timeSec >= recordingStartTime) {
-                                drawFrame(timeSec, frame);
-
-                                if (encoder && encoder.state === 'configured') {
-                                    const pts = Math.round(frameCount * frameDurationUs);
-                                    const forceKeyFrame = (frameCount % keyframeInterval) === 0;
-
-                                    const outFrame = new VideoFrame(cvs, {
-                                        timestamp: pts,
-                                        duration: frameDurationUs
-                                    });
-                                    maybeEncode(outFrame, { keyFrame: forceKeyFrame });
-                                    outFrame.close();
-                                    frameCount++;
-
-                                    const now = performance.now();
-                                    if (now - lastUiUpdateTs > 100) {
-                                        lastUiUpdateTs = now;
-                                        currentStatusKey = 'statusSynthesizingProgress';
-                                        currentStatusArg = (timeSec - recordingStartTime).toFixed(1);
-                                        currentStatusIsRec = true;
-                                        statusText.textContent = t('statusSynthesizingProgress', currentStatusArg);
-                                        timeSlider.value = timeToSlider(timeSec, vid.duration, firstKeyFrameTime);
-                                        timeDisplay.textContent = `${formatTime(timeSec)} / ${formatTime(vid.duration)}`;
-                                    }
-                                }
-                            }
-                        } catch (e) {
-                            cleanup();
-                            reject(e);
-                        } finally {
-                            frame.close();
-                            pendingFramesCount--;
-                            frameProcessedSignal();
-                        }
-                    },
-                    error: (e) => {
-                        cleanup();
-                        reject(e);
-                    }
-                });
-
-                decoder.configure({
-                    codec: config.codec,
-                    codedWidth: config.width,
-                    codedHeight: config.height,
-                    description: config.description,
-                    hardwareAcceleration: 'no-preference'
-                });
+                const cleanup = () => { onEncoderError = null; };
+                onEncoderError = (err) => { cleanup(); reject(err); };
 
                 const yieldMacrotask = (() => {
                     const channel = new MessageChannel();
@@ -822,42 +829,133 @@
                     });
                 })();
 
-                let hasSeenKeyFrame = false;
-                for (let i = startIdx; i < samples.length; i++) {
-                    if (!isRecording) break;
+                const processClip = async (clip, clipOrdinal) => {
+                    currentClipContext = clip;
+                    const config = clip.config;
+                    const samples = clip.samples;
+                    // 多段或拼接段的后续片段一律从头开始；仅首段单文件合成允许跳到录制起点
+                    const skipBefore = (clipOrdinal > 0) ? 0 : recordingStartTime;
 
-                    const s = samples[i];
-                    const isKeyFrame = s.type === 'key';
+                    const decoder = new VideoDecoder({
+                        output: (frame) => {
+                            pendingFramesCount++;
+                            try {
+                                if (!isRecording) { frame.close(); pendingFramesCount--; frameProcessedSignal(); return; }
+                                const timeSec = frame.timestamp / 1000000;
+                                if (timeSec >= skipBefore) {
+                                    drawFrame(timeSec, frame);
 
-                    if (!hasSeenKeyFrame && !isKeyFrame) {
-                        continue;
+                                    if (encoder && encoder.state === 'configured') {
+                                        const pts = Math.round(frameCount * frameDurationUs);
+                                        const forceKeyFrame = (frameCount % keyframeInterval) === 0;
+
+                                        const outFrame = new VideoFrame(cvs, {
+                                            timestamp: pts,
+                                            duration: frameDurationUs
+                                        });
+                                        maybeEncode(outFrame, { keyFrame: forceKeyFrame });
+                                        outFrame.close();
+                                        frameCount++;
+
+                                        const now = performance.now();
+                                        if (now - lastUiUpdateTs > 100) {
+                                            lastUiUpdateTs = now;
+                                            currentStatusKey = 'statusSynthesizingProgress';
+                                            const relSec = (clip.videoStartTime - refClip.videoStartTime) / 1000 + timeSec;
+                                            currentStatusArg = relSec.toFixed(1);
+                                            currentStatusIsRec = true;
+                                        statusText.textContent = t('statusSynthesizingProgress', currentStatusArg)
+                                            + (isMerge ? ` (${clipOrdinal + 1}/${clips.length})` : '');
+                                        // 合成进度条跨段连续：全局时间 = 该段偏移 + 段内时间
+                                        const gt = mergedOffsets[clipOrdinal] + timeSec;
+                                        timeSlider.value = globalTimeToSlider(gt);
+                                        timeDisplay.textContent = `${formatTime(gt)} / ${formatTime(mergedTotalDuration)}`;
+                                        }
+                                    }
+                                }
+                            } catch (e) {
+                                cleanup();
+                                reject(e);
+                            } finally {
+                                frame.close();
+                                pendingFramesCount--;
+                                frameProcessedSignal();
+                            }
+                        },
+                        error: (e) => { cleanup(); reject(e); }
+                    });
+
+                    decoder.configure({
+                        codec: config.codec,
+                        codedWidth: config.width,
+                        codedHeight: config.height,
+                        description: config.description,
+                        hardwareAcceleration: 'no-preference'
+                    });
+
+                    let hasSeenKeyFrame = false;
+                    let startIdx = 0;
+                    if (clipOrdinal === 0) {
+                        // 首段始终从首个关键帧开始解码，避免首帧非关键帧导致的黑屏/绿屏
+                        for (let i = 0; i < samples.length; i++) {
+                            if (samples[i].type === 'key') { startIdx = i; break; }
+                        }
                     }
-                    hasSeenKeyFrame = true;
-
-                    while (isRecording && (decoder.decodeQueueSize > 8 || (encoder && encoder.encodeQueueSize > 8))) {
-                        await yieldMacrotask();
+                    if (clipOrdinal === 0 && recordingStartTime > 0) {
+                        const startTimeUs = recordingStartTime * 1000000;
+                        let lastKeyIdx = 0;
+                        for (let i = 0; i < samples.length; i++) {
+                            if (samples[i].type === 'key') lastKeyIdx = i;
+                            if (samples[i].timestamp >= startTimeUs) { startIdx = lastKeyIdx; break; }
+                        }
                     }
 
-                    const sampleData = await s.loadData();
-                    decoder.decode(new EncodedVideoChunk({
-                        type: s.type,
-                        timestamp: s.timestamp,
-                        duration: s.duration,
-                        data: sampleData
-                    }));
-                }
+                    for (let i = startIdx; i < samples.length; i++) {
+                        if (!isRecording) break;
 
-                if (isRecording) {
-                    await decoder.flush();
-                    while (pendingFramesCount > 0) {
-                        await waitForFrameProcessed();
+                        const s = samples[i];
+                        const isKeyFrame = s.type === 'key';
+
+                        if (!hasSeenKeyFrame && !isKeyFrame) {
+                            continue;
+                        }
+                        hasSeenKeyFrame = true;
+
+                        while (isRecording && (decoder.decodeQueueSize > 8 || (encoder && encoder.encodeQueueSize > 8))) {
+                            await yieldMacrotask();
+                        }
+
+                        const sampleData = await s.loadData();
+                        decoder.decode(new EncodedVideoChunk({
+                            type: s.type,
+                            timestamp: s.timestamp,
+                            duration: s.duration,
+                            data: sampleData
+                        }));
+                    }
+
+                    if (isRecording) {
+                        await decoder.flush();
+                        while (pendingFramesCount > 0) {
+                            await waitForFrameProcessed();
+                        }
                     }
                     decoder.close();
+                };
+
+                try {
+                    for (let clipOrdinal = 0; clipOrdinal < clips.length; clipOrdinal++) {
+                        if (!isRecording) break;
+                        await processClip(clips[clipOrdinal], clipOrdinal);
+                    }
+                    if (isRecording) {
+                        currentClipContext = refClip;
+                        cleanup();
+                        await stopRecording();
+                    }
+                } catch (e) {
                     cleanup();
-                    await stopRecording();
-                } else {
-                    decoder.close();
-                    cleanup();
+                    reject(e);
                 }
                 resolve();
             });
@@ -940,6 +1038,7 @@
         if (!source || (!sourceFrame && source.readyState < 2)) return;
 
         const currentTime = forcedTime ?? vid.currentTime;
+        const ctx = currentClipContext || { videoStartTime, parsedFrames, fps };
         const fontStack = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
 
         // 1. Sync dimensions & Text Canvas sizing
@@ -991,7 +1090,7 @@
         }
 
         // 2. Prepare Strings
-        reusableDate.setTime(videoStartTime + currentTime * 1000);
+        reusableDate.setTime(ctx.videoStartTime + currentTime * 1000);
         const timeStr = formatDate(reusableDate);
         let seiText = "";
 
@@ -1004,9 +1103,9 @@
         let isRightBlinkerOn = false;
         let blinkPhase = 0;
 
-        if (parsedFrames && parsedFrames.length > 0) {
-            const frameIndex = Math.min(Math.floor(currentTime * fps), parsedFrames.length - 1);
-            const frame = parsedFrames[frameIndex];
+        if (ctx.parsedFrames && ctx.parsedFrames.length > 0) {
+            const frameIndex = Math.min(Math.floor(currentTime * ctx.fps), ctx.parsedFrames.length - 1);
+            const frame = ctx.parsedFrames[frameIndex];
             if (frame && frame.sei) {
                 const sei = frame.sei;
                 const speed = Math.round((sei.vehicleSpeedMps || 0) * 3.6);
@@ -1161,9 +1260,11 @@
         }
 
         if (!dragging) {
-            timeSlider.value = timeToSlider(vid.currentTime, vid.duration, firstKeyFrameTime);
+            const gt = mergedOffsets[previewClipIndex] + vid.currentTime;
+            timeSlider.value = globalTimeToSlider(gt);
         }
-        timeDisplay.textContent = `${formatTime(vid.currentTime)} / ${formatTime(vid.duration)}`;
+        const gtDisplay = mergedOffsets[previewClipIndex] + vid.currentTime;
+        timeDisplay.textContent = `${formatTime(gtDisplay)} / ${formatTime(mergedTotalDuration)}`;
 
         const now = Date.now();
         if (!vid.paused && !document.hidden) {
@@ -1199,115 +1300,22 @@
         }
     });
 
-    const handleFile = async (file) => {
-        if (!file) return;
-        const isVideo = file.type.startsWith('video/') || file.name.match(/\.(mp4|mov|m4v)$/i);
-        if (!isVideo) return;
-
-        videoStartTime = 0;
-        parsedFrames = [];
-        currentParser = null;
-        firstPlayLock = true;
-        firstKeyFrameTime = 0;
+    const setupPreview = async (clip, autoPlay = false) => {
         if (vid) {
             vid.pause();
             if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
         }
-
-        syncPlayButton(true);
-        fps = 36;
-        cachedCanvasWidth = -1; cachedCanvasHeight = -1;
-        textTextureInitialized = false;
-
-        videoViewer.style.display = "block"; dropZone.style.display = "none";
-        currentStatusKey = 'statusParsing'; currentStatusArg = null; currentStatusIsRec = false;
-        updateStatus(t('statusParsing'));
-
-        vidName = file.name.substring(0, file.name.lastIndexOf('.'));
-        originalFileLastModified = file.lastModified;
-
-        const dateMatch = file.name.match(/(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})/);
-
-        try {
-            const buffer = await file.arrayBuffer();
-            const protobufData = await DashcamHelpers.initProtobuf();
-            enumFields = protobufData.enumFields;
-            currentParser = new DashcamMP4(buffer);
-            parsedFrames = await currentParser.parseFrames(protobufData.SeiMetadata);
-
-            try {
-                const allSamples = currentParser.getSamples();
-                for (const s of allSamples) {
-                    if (s.type === 'key') {
-                        firstKeyFrameTime = s.timestamp / 1000000;
-                        break;
-                    }
-                }
-                if (firstKeyFrameTime > 0.02) {
-                    console.log(`检测到视频首帧非关键帧，首个关键帧位于 ${firstKeyFrameTime.toFixed(3)}s，将 seek 到该位置以避免 iOS Safari 黑屏`);
-                }
-            } catch (e) { }
-
-            try {
-                const config = currentParser.getConfig();
-                if (config.durations && config.durations.length > 0) {
-                    const totalDurationMs = config.durations.reduce((a, b) => a + b, 0);
-                    if (totalDurationMs > 0) fps = Math.round(config.durations.length / (totalDurationMs / 1000));
-                    const samples = currentParser.getSamples();
-                    const totalVideoBytes = samples.reduce((sum, s) => sum + s.size, 0);
-                    const durationSec = totalDurationMs / 1000;
-                    const originalBitrate = Math.round((totalVideoBytes * 8) / durationSec);
-                    const exportW = Math.min(config.width, EXPORT_MAX_WIDTH);
-                    const scaleRatio = exportW / config.width;
-                    const retentionRatio = scaleRatio < 1.0 ? Math.max(0.8, scaleRatio) : 1.0;
-                    const iosMultiplier = isIOSDevice() ? 2.0 : 1.0;
-                    const optimalBitrate = Math.round(originalBitrate * retentionRatio * iosMultiplier);
-                    const minBitrate = Math.round(5000000 * iosMultiplier);
-                    const maxBitrate = Math.round(15000000 * iosMultiplier);
-                    targetBitrate = Math.max(minBitrate, Math.min(optimalBitrate, maxBitrate));
-                    console.log(`码率计算 [设备=${isIOSDevice() ? 'iOS (系数 2.0x)' : 'Windows/其他 (1.0x)'}]：原始码率=${(originalBitrate / 1000000).toFixed(2)}M, 导出目标码率=${(targetBitrate / 1000000).toFixed(2)}M`);
-                }
-            } catch (e) {
-                const iosMultiplier = isIOSDevice() ? 2.0 : 1.0;
-                targetBitrate = Math.round(5000000 * iosMultiplier);
-            }
-
-            const firstSei = parsedFrames.find(f => f.sei)?.sei;
-            const mp4CreationTime = currentParser.getCreationTime();
-            let timeBaseSource = "fallback";
-
-            if (firstSei && firstSei.frameSeqNo) {
-                const seq = Number(firstSei.frameSeqNo);
-                if (seq > 1000000000000) {
-                    videoStartTime = seq;
-                    timeBaseSource = "SEI 毫秒级时间戳";
-                } else if (seq > 1000000000) {
-                    videoStartTime = seq * 1000;
-                    timeBaseSource = "SEI 秒级时间戳";
-                }
-            }
-
-            if (!videoStartTime && dateMatch) {
-                videoStartTime = new Date(`${dateMatch[1].replace(/-/g, '/')} ${dateMatch[2].replace(/-/g, ':')}`).getTime();
-                timeBaseSource = "文件名日期";
-            }
-
-            if (!videoStartTime) {
-                if (mp4CreationTime) {
-                    videoStartTime = mp4CreationTime;
-                    timeBaseSource = "MP4 头部创建时间";
-                } else {
-                    videoStartTime = originalFileLastModified || Date.now();
-                    timeBaseSource = originalFileLastModified ? "文件最后修改时间" : "当前系统时间";
-                }
-            }
-            console.log(`时间基准确定：${timeBaseSource} (${videoStartTime})`);
-            originalMediaDate = Math.floor(videoStartTime / 1000) + MP4_EPOCH_OFFSET;
-        } catch (e) {
-            console.error("解析遥测数据失败", e);
-            parsedFrames = [];
-            if (!videoStartTime) videoStartTime = originalFileLastModified || Date.now();
-        }
+        currentParser = clip.parser;
+        parsedFrames = clip.parsedFrames;
+        videoStartTime = clip.videoStartTime;
+        fps = clip.fps;
+        firstKeyFrameTime = clip.firstKeyFrameTime;
+        firstPlayLock = !autoPlay;
+        vidName = clip.name;
+        originalFileLastModified = clip.lastModified;
+        enumFields = clip.enumFields;
+        currentClipContext = clip;
+        previewClipIndex = clips.indexOf(clip);
 
         currentStatusKey = 'statusLoading'; currentStatusArg = null; currentStatusIsRec = false;
         updateStatus(t('statusLoading'));
@@ -1339,7 +1347,8 @@
             if (isSeeking) return;
             if (!nextVid.paused) return;
 
-            const seekTarget = firstKeyFrameTime > 0.02 ? firstKeyFrameTime : 0;
+            let seekTarget = firstKeyFrameTime > 0.02 ? firstKeyFrameTime : 0;
+            if (pendingSeekTime != null) seekTarget = Math.max(seekTarget, pendingSeekTime);
             const needsSeek = seekTarget > 0
                 ? Math.abs(nextVid.currentTime - seekTarget) > 0.05
                 : nextVid.currentTime > 0.1;
@@ -1358,16 +1367,26 @@
             if (nextVid.readyState < 2) return;
 
             isReady = true;
-            firstPlayTargetTime = firstKeyFrameTime > 0.02 ? firstKeyFrameTime : 0;
+            pendingClipSwitch = null;
+            const wasPendingSeek = pendingSeekTime != null;
+            firstPlayTargetTime = wasPendingSeek ? pendingSeekTime
+                : (firstKeyFrameTime > 0.02 ? firstKeyFrameTime : 0);
+            pendingSeekTime = null;
             if (wxBridgeHandler) {
                 document.removeEventListener('WeixinJSBridgeReady', wxBridgeHandler);
                 wxBridgeHandler = null;
             }
 
-            startRecBtn.disabled = !checkCapabilities();
             currentStatusKey = 'statusReady'; currentStatusArg = null; currentStatusIsRec = false;
             updateStatus(t('statusReady'));
-
+            updateStartButtonState();
+            // 跨段拖动定位(setupPreview(autoPlay=false) + pendingSeekTime)后停在该位置，不自动播放
+            if (autoPlay && !wasPendingSeek) {
+                syncPlayButton(false);
+                playPending = true;
+                if (animationId === null) animationId = requestAnimationFrame(render);
+                nextVid.play().catch(() => { syncPlayButton(true); });
+            }
             render();
         };
 
@@ -1388,13 +1407,22 @@
             onReady();
             if (nextVid.paused) render();
         };
-        nextVid.onended = () => { syncPlayButton(true); animationId = null; };
+        nextVid.onended = () => {
+            syncPlayButton(true);
+            animationId = null;
+            if (isRecording) return;
+            // 自动续播下一段，实现多视频连续预览
+            if (clips.length > 1 && previewClipIndex >= 0 && previewClipIndex < clips.length - 1) {
+                setupPreview(clips[previewClipIndex + 1], true);
+            }
+        };
 
         const handleStall = () => { if (!nextVid.paused && !isRecording) nextVid.currentTime += 0.005; };
         nextVid.onwaiting = handleStall;
         nextVid.onstalled = handleStall;
 
-        currentVideoUrl = URL.createObjectURL(file);
+        if (currentVideoUrl) { try { URL.revokeObjectURL(currentVideoUrl); } catch (e) { } }
+        currentVideoUrl = URL.createObjectURL(clip.file);
         nextVid.src = currentVideoUrl;
         vid = nextVid;
         nextVid.load();
@@ -1403,6 +1431,8 @@
             if (isReady) return;
             try {
                 if (doLoad) nextVid.load();
+                // 自动续播模式：不在此主动 play，留给 onReady 在 seek 到起点后再播放，避免首帧黑屏
+                if (autoPlay) return;
                 // iOS Safari: calling play() without user gesture rejects but may still trigger
                 // the media pipeline to start buffering/decoding, causing currentTime to drift
                 // even while the video appears paused. Use load()+events only on iOS.
@@ -1415,13 +1445,13 @@
                 const p = nextVid.play();
                 if (p && typeof p.then === 'function') {
                     p.then(() => {
-                        nextVid.pause();
+                        if (!autoPlay) nextVid.pause();
                     }).catch(() => {
                         if (nextVid.readyState >= 1 || nextVid.videoWidth) onReady();
                     });
                 } else {
                     // Older browser: play() returns undefined, ensure video is paused
-                    setTimeout(() => { nextVid.pause(); }, 100);
+                    setTimeout(() => { if (!autoPlay) nextVid.pause(); }, 100);
                 }
             } catch (e) { }
         };
@@ -1432,26 +1462,22 @@
         }
         wxBridgeHandler = () => tryActivate(true);
         document.addEventListener('WeixinJSBridgeReady', wxBridgeHandler, { once: true });
-        fileInput.value = "";
     };
 
     const handleFiles = async (fileList) => {
         if (!fileList || fileList.length === 0) return;
 
-        let videoFile = null;
         let jsonFile = null;
-
+        const videoFiles = [];
         for (let i = 0; i < fileList.length; i++) {
             const f = fileList[i];
-            const isVideo = f.type.startsWith('video/') || f.name.match(/\.(mp4|mov|m4v)$/i);
+            const isVideo = f.type.startsWith('video/') || /\.(mp4|mov|m4v)$/i.test(f.name);
             const isJson = f.name.toLowerCase().endsWith('.json') || f.type === 'application/json';
-            if (isVideo && !videoFile) {
-                videoFile = f;
-            } else if (isJson && !jsonFile) {
-                jsonFile = f;
-            }
+            if (isVideo) videoFiles.push(f);
+            else if (isJson && !jsonFile) jsonFile = f;
         }
 
+        // event.json 坐标（合并后写入首段元数据）
         if (jsonFile) {
             try {
                 const text = await jsonFile.text();
@@ -1459,10 +1485,7 @@
                 const lat = data.est_lat !== undefined ? data.est_lat : data.latitude;
                 const lon = data.est_lon !== undefined ? data.est_lon : data.longitude;
                 if (lat !== undefined && lon !== undefined && !isNaN(parseFloat(lat)) && !isNaN(parseFloat(lon))) {
-                    eventLocation = {
-                        lat: parseFloat(lat),
-                        lon: parseFloat(lon)
-                    };
+                    eventLocation = { lat: parseFloat(lat), lon: parseFloat(lon) };
                     console.log("已成功读取 event.json 坐标:", eventLocation);
                 } else {
                     eventLocation = null;
@@ -1475,8 +1498,56 @@
             eventLocation = null;
         }
 
-        if (videoFile) {
-            await handleFile(videoFile);
+        if (videoFiles.length === 0) return;
+
+        syncPlayButton(true);
+        fps = 36;
+        cachedCanvasWidth = -1; cachedCanvasHeight = -1;
+        textTextureInitialized = false;
+        videoViewer.style.display = "block"; dropZone.style.display = "none";
+        currentStatusKey = 'statusParsing'; currentStatusArg = null; currentStatusIsRec = false;
+        updateStatus(t('statusParsing'));
+
+        const parsed = [];
+        for (const f of videoFiles) {
+            try {
+                const c = await MergeManager.prepareClip(f);
+                if (c) parsed.push(c);
+            } catch (e) {
+                console.error("解析视频失败:", f.name, e);
+            }
+        }
+        if (parsed.length === 0) {
+            currentStatusKey = 'statusError'; currentStatusArg = '解析失败'; currentStatusIsRec = false;
+            updateStatus(t('statusError', '没有可解析的视频'));
+            return;
+        }
+
+        clips = MergeManager.sortClips(parsed);
+        for (const c of clips) c.targetBitrate = computeTargetBitrate(c);
+        mergeAnalysis = MergeManager.analyzeClips(clips);
+        computeMergedTimeline();
+
+        originalMediaDate = Math.floor(clips[0].videoStartTime / 1000) + MP4_EPOCH_OFFSET;
+        vidName = clips[0].name + (clips.length > 1 ? '_merged' : '');
+        targetBitrate = clips[0].targetBitrate;
+        currentClipContext = clips[0];
+
+        await setupPreview(clips[0]);
+        fileInput.value = "";
+        updateStartButtonState();
+    };
+
+    const updateStartButtonState = () => {
+        if (!clips || clips.length === 0) { startRecBtn.disabled = true; return; }
+        const capOk = checkCapabilities();
+        const resOk = mergeAnalysis ? mergeAnalysis.resolutionOk : true;
+        startRecBtn.disabled = !(capOk && resOk);
+        if (!resOk) {
+            statusText.textContent = '分辨率不一致：请仅导入同一摄像头视角的视频';
+        } else if (clips.length > 1) {
+            const gaps = mergeAnalysis.continuity.filter(c => c.status !== 'continuous' && c.status !== 'start');
+            statusText.textContent = `已导入 ${clips.length} 段` + (gaps.length ? ` · ${gaps.length} 处时间不连续` : ' · 时间连续');
         }
     };
 
@@ -1577,24 +1648,70 @@
     };
 
     if (timeSlider) {
+        // 统一的全局时间定位：live=true 表示拖动过程中（oninput），false 表示松手（onchange）
+        // 跨片段拖动时「立即」切换视频源并在目标位置定位，使预览在拖动过程中实时跟随进度条，
+        // 而不是停在旧片段的末帧/首帧直到松手。
+        const applyGlobalScrub = (live) => {
+            const gt = sliderToGlobalTime(timeSlider.value);
+            timeDisplay.textContent = `${formatTime(gt)} / ${formatTime(mergedTotalDuration)}`;
+            const { i, localTime } = findClipForGlobalTime(gt);
+            const targetClip = clips[i] || null;
+            const fkf = targetClip ? targetClip.firstKeyFrameTime : 0;
+            // 首帧非关键帧：落点在首个关键帧之前时对齐到关键帧，避免预览黑屏与解码卡顿
+            const clamped = (fkf > 0.02 && localTime < fkf) ? fkf : localTime;
+
+            if (i === previewClipIndex) {
+                // 本段内：实时拖动预览
+                pendingClipSwitch = null;
+                scrubTarget = clamped;
+                if (live && !scrubRaf) {
+                    lastScrubTime = 0;
+                    scrubRaf = requestAnimationFrame(scrubLoop);
+                }
+            } else {
+                // 跨片段：立即切换视频源并在目标位置定位，使画面随拖动实时更新
+                pendingSeekTime = clamped;
+                if (pendingClipSwitch !== i) {
+                    pendingClipSwitch = i;
+                    if (vid) vid.pause();
+                    setupPreview(clips[i], false);
+                }
+                scrubTarget = null;
+            }
+        };
+
         timeSlider.oninput = () => {
             dragging = true;
-            const previewTime = sliderToTime(timeSlider.value, vid.duration, firstKeyFrameTime);
-            timeDisplay.textContent = `${formatTime(previewTime)} / ${formatTime(vid.duration)}`;
-            scrubTarget = sliderToTime(timeSlider.value, vid.duration, firstKeyFrameTime);
-            if (!scrubRaf) {
-                lastScrubTime = 0;
-                scrubRaf = requestAnimationFrame(scrubLoop);
-            }
+            applyGlobalScrub(true);
         };
 
         timeSlider.onchange = () => {
             if (scrubRaf) { cancelAnimationFrame(scrubRaf); scrubRaf = null; }
-            scrubTarget = null;
-            firstPlayLock = false;
-            vid.currentTime = sliderToTime(timeSlider.value, vid.duration, firstKeyFrameTime);
+            const gt = sliderToGlobalTime(timeSlider.value);
+            const { i, localTime } = findClipForGlobalTime(gt);
             dragging = false;
-            render();
+            firstPlayLock = false;
+            if (i === previewClipIndex) {
+                scrubTarget = null;
+                let target = localTime;
+                const fkf = clips[i] ? clips[i].firstKeyFrameTime : 0;
+                if (fkf > 0.02 && target < fkf) target = fkf;
+                vid.currentTime = target;
+                if (target !== localTime) {
+                    const ng = mergedOffsets[i] + target;
+                    timeSlider.value = globalTimeToSlider(ng);
+                    timeDisplay.textContent = `${formatTime(ng)} / ${formatTime(mergedTotalDuration)}`;
+                }
+                render();
+            } else {
+                // 兜底：极少数情况（如某些浏览器点击未触发 oninput）下跨段跳转
+                pendingSeekTime = (clips[i] && clips[i].firstKeyFrameTime > 0.02 && localTime < clips[i].firstKeyFrameTime)
+                    ? clips[i].firstKeyFrameTime : localTime;
+                if (pendingClipSwitch !== i) {
+                    pendingClipSwitch = i;
+                    setupPreview(clips[i], false);
+                }
+            }
         };
     }
 

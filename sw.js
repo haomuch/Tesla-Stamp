@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tesla-dashcam-stamp-v2';
+const CACHE_NAME = 'tesla-dashcam-stamp-v3';
 const ASSETS_TO_CACHE = [
   './index.html',
   './manifest.json',
@@ -9,6 +9,7 @@ const ASSETS_TO_CACHE = [
   './public/js/mp4-parser.js',
   './public/js/i18n.js',
   './public/js/telemetry-renderer.js',
+  './public/js/merge-manager.js',
   './public/js/app.js'
 ];
 

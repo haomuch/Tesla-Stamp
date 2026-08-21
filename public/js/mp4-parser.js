@@ -383,7 +383,7 @@ window.DashcamMP4 = DashcamMP4;
         bool blinker_on_left = 7;
         bool blinker_on_right = 8;
         bool brake_applied = 9;
-        enum AutopilotState { NONE = 0; FULL = 1; AUTO = 2; TACC = 3; }
+        enum AutopilotState { NONE = 0; TACC = 1; AUTO = 2; FULL = 3; }
         AutopilotState autopilot_state = 10;
         double latitude_deg = 11;
         double longitude_deg = 12;

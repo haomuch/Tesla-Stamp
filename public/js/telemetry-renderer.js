@@ -330,7 +330,7 @@ function drawTeslaBlinkers(ctx, x, centerY, size, isLeftOn, isRightOn, blinkPhas
         ctx.strokeStyle = '#34D399';
     } else {
         ctx.shadowBlur = 0;
-        ctx.fillStyle = isLeftOn ? '#1F3A2B' : '#2D333B';
+        ctx.fillStyle = isRightOn ? '#1F3A2B' : '#2D333B';
         ctx.strokeStyle = isRightOn ? '#059669' : '#4B5563';
     }
     pathRightArrow(rightX, centerY);

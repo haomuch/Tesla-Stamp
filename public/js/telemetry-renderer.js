@@ -216,9 +216,9 @@ function drawTeslaAccel(ctx, x, centerY, size, accelNum, fontStack) {
     // 2. High-Tech Segmented Tesla Energy Bar
     const barX = pedalX + pedalW + size * 0.18;
     const barW = size * 1.5;
-    const barH = size * 0.42;
+    const barH = size * 0.55;
     const barY = centerY - barH * 0.5;
-    const numSegments = 8;
+    const numSegments = 10;
     const segGap = size * 0.04;
     const segW = (barW - (numSegments - 1) * segGap) / numSegments;
     const activeCount = Math.round((pct / 100) * numSegments);

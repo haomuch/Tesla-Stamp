@@ -190,6 +190,7 @@
     let vidName = "tesla_dashcam";
     let videoStartTime = 0;
     let isRecording = false;
+    let startRequestPending = false; // 合成启动锁：initRecorder 含多次 await，防止重复进入
     let animationId = null;
     let playPending = false;
     let currentVideoUrl = null;
@@ -623,7 +624,12 @@
         return candidates[candidates.length - 1];
     };
 
-    const initRecorder = async (isHEVC = false, srcWidth = null, srcHeight = null) => {
+    const initRecorder = async (isHEVC = false, srcWidth = null, srcHeight = null, framerate = null) => {
+        // 导出帧率必须与 PTS 计算所用的帧率一致（见 startRecording 的 activeFps）。
+        // 不能直接用全局 fps：它由 setupPreview 设为「当前预览片段」的帧率，
+        // 多段合并且各段 fps 不同时会导致输出时长/播放速度错误。
+        const exportFps = (typeof framerate === 'number' && framerate > 0) ? framerate : fps;
+
         if (!supportsWebCodecs) {
             const layout = getScaledCompositeLayout(
                 srcWidth != null ? srcWidth : (vid ? vid.videoWidth : 0),
@@ -641,7 +647,7 @@
             cachedCanvasHeight = -1;
             textTextureInitialized = false;
 
-            const stream = cvs.captureStream(30);
+            const stream = cvs.captureStream(exportFps);
             const mimeCandidates = [
                 'video/mp4;codecs="avc1.640028"',
                 'video/mp4;codecs="avc1.42E01E"',
@@ -703,11 +709,11 @@
         let muxerCodec = "avc";
 
         if (isHEVC) {
-            const candidateCodec = await getBestSupportedCodec('hevc', exportWidth, exportHeight, targetBitrate, fps);
+            const candidateCodec = await getBestSupportedCodec('hevc', exportWidth, exportHeight, targetBitrate, exportFps);
             try {
                 const support = await VideoEncoder.isConfigSupported({
                     codec: candidateCodec, width: exportWidth, height: exportHeight,
-                    bitrate: targetBitrate, framerate: fps
+                    bitrate: targetBitrate, framerate: exportFps
                 });
                 if (support.supported) {
                     encoderCodec = candidateCodec;
@@ -717,7 +723,7 @@
         }
 
         if (!encoderCodec) {
-            encoderCodec = await getBestSupportedCodec('avc', exportWidth, exportHeight, targetBitrate, fps);
+            encoderCodec = await getBestSupportedCodec('avc', exportWidth, exportHeight, targetBitrate, exportFps);
             muxerCodec = "avc";
         }
 
@@ -735,7 +741,7 @@
         });
         encoder.configure({
             codec: encoderCodec, width: exportWidth, height: exportHeight,
-            bitrate: targetBitrate, framerate: fps
+            bitrate: targetBitrate, framerate: exportFps
         });
         return true;
     };
@@ -747,6 +753,11 @@
     };
 
     const startRecording = async () => {
+        // 竞态防护：initRecorder 内部有多次 await（编码器能力检测），在此期间
+        // startRecBtn 尚未禁用、isRecording 尚未置位，重复点击会并发启动多个合成流程，
+        // 导致多个 VideoEncoder 写入同一个 muxer，输出文件损坏。
+        if (startRequestPending || isRecording) return;
+        startRequestPending = true;
         try {
             if (!clips || clips.length === 0 || !window.VideoDecoder) return;
             const isMerge = clips.length > 1;
@@ -754,7 +765,13 @@
             if (!isMerge && vid && vid.currentTime >= vid.duration) vid.currentTime = 0;
 
             const isHEVC = refClip.config.codec === 'hevc';
-            if (!(await initRecorder(isHEVC, refClip.config.width, refClip.config.height))) return;
+            // 首段帧率即本次合成的基准帧率，编码器配置与 PTS 计算共用同一个值
+            const activeFps = (refClip.fps > 10 && refClip.fps < 100) ? refClip.fps : 36;
+            startRecBtn.disabled = true;
+            if (!(await initRecorder(isHEVC, refClip.config.width, refClip.config.height, activeFps))) {
+                updateStartButtonState();
+                return;
+            }
 
             if (vid) vid.pause();
 
@@ -790,7 +807,7 @@
                 }
             }
             isRecording = true;
-            frameCount = 0; startRecBtn.disabled = true; stopRecBtn.disabled = false;
+            frameCount = 0; stopRecBtn.disabled = false;
             playPauseBtn.disabled = true; timeSlider.disabled = true;
 
             let pendingFramesCount = 0;
@@ -803,7 +820,6 @@
             currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
             updateStatus(t('statusPreparing'), true);
 
-            const activeFps = (refClip.fps > 10 && refClip.fps < 100) ? refClip.fps : 36;
             const frameDurationUs = Math.round(1000000 / activeFps);
             const keyframeInterval = Math.max(1, Math.round(activeFps / 2));
 
@@ -964,6 +980,13 @@
             currentStatusKey = 'statusError'; currentStatusArg = e.message; currentStatusIsRec = false;
             updateStatus(t('statusError', e.message));
             isRecording = false;
+            // 合成失败时 muxer/encoder 仍持有已编码的输出缓冲（可达数百 MB），
+            // 必须显式释放，否则连续失败几次就会耗尽内存。
+            muxer = null;
+            if (encoder) {
+                try { if (encoder.state !== 'closed') encoder.close(); } catch (_) { }
+                encoder = null;
+            }
             if (vid) {
                 const layout = getCompositeLayout(vid.videoWidth, vid.videoHeight);
                 cvs.width = layout.width;
@@ -977,6 +1000,8 @@
             stopRecBtn.disabled = true;
             playPauseBtn.disabled = false;
             timeSlider.disabled = false;
+        } finally {
+            startRequestPending = false;
         }
     };
 
@@ -1011,6 +1036,10 @@
         if (muxer) {
             muxer.finalize();
             const { buffer } = muxer.target;
+            // 立即切断 muxer 对完整输出 MP4（可达数百 MB）的引用，否则模块级变量会
+            // 把它一直钉在堆上直到下次合成，连续导出极易 OOM。
+            // 数据本身由 finalBuffer → finalBlob → blob URL 独立持有，释放是安全的。
+            muxer = null;
             let finalBuffer = patchMp4Metadata(buffer, originalMediaDate, eventLocation);
             let finalBlob = new Blob([finalBuffer], { type: 'video/mp4' });
             const file = new File([finalBlob], `${vidName}_stamp.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
@@ -1027,6 +1056,7 @@
             cachedCanvasHeight = -1;
             textTextureInitialized = false;
         }
+        encoder = null;
         startRecBtn.disabled = false; stopRecBtn.disabled = true;
         playPauseBtn.disabled = false; timeSlider.disabled = false;
     };

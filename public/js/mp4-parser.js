@@ -71,15 +71,22 @@ class DashcamMP4 {
         for (let pos = start; pos + 8 <= end;) {
             let size = this.view.getUint32(pos);
             const type = this.readAscii(pos + 4, 4);
-            const headerSize = size === 1 ? 16 : 8;
+            let headerSize = 8;
 
             if (size === 1) {
+                // largesize 需要额外 8 字节，越界则视为损坏，直接终止遍历
+                if (pos + 16 > end) break;
                 const high = this.view.getUint32(pos + 8);
                 const low = this.view.getUint32(pos + 12);
                 size = Number((BigInt(high) << 32n) | BigInt(low));
+                headerSize = 16;
             } else if (size === 0) {
                 size = end - pos;
             }
+
+            // 损坏/截断文件可能解析出非法长度（小于头部或越界）。
+            // 若不拦截，pos 不前进会导致死循环并永久冻结主线程。
+            if (!Number.isFinite(size) || size < headerSize || pos + size > end) break;
 
             if (type === name) {
                 return { start: pos + headerSize, end: pos + size, size: size - headerSize };

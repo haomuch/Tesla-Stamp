@@ -184,6 +184,9 @@
     let cachedLayout = null;
     let cachedSingleDigitWidth = 0;
     let textTextureInitialized = false;
+    let videoTextureInitialized = false;
+    let videoTexWidth = 0;
+    let videoTexHeight = 0;
 
     let vid = null;
     let dragging = false;
@@ -730,7 +733,9 @@
         muxer = new Mp4Muxer.Muxer({
             target: new Mp4Muxer.ArrayBufferTarget(),
             video: { codec: muxerCodec, width: exportWidth, height: exportHeight },
-            fastStart: 'in-memory', firstTimestampBehavior: 'offset'
+            // 不使用 'in-memory'：它会在 finalize 时把整个文件重排到一份新 buffer，
+            // 使导出峰值内存翻倍（数百 MB）。moov 位于尾部的 MP4 本地播放完全正常。
+            fastStart: false, firstTimestampBehavior: 'offset'
         });
         encoder = new VideoEncoder({
             output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
@@ -1057,6 +1062,8 @@
             textTextureInitialized = false;
         }
         encoder = null;
+        // 释放各片段解析器的顺序预读缓冲（每个最多 1MB）
+        for (const c of clips) { if (c.parser) c.parser.releaseReadBuffer(); }
         startRecBtn.disabled = false; stopRecBtn.disabled = true;
         playPauseBtn.disabled = false; timeSlider.disabled = false;
     };
@@ -1146,7 +1153,7 @@
                 accelNum = Math.round(sei.acceleratorPedalPosition || 0);
                 speedVal = speed.toString();
 
-                const rawGear = sei.gearState !== undefined ? sei.gearState : sei.gear_state;
+                const rawGear = sei.gearState;
                 if (enumFields && enumFields.gearState && enumFields.gearState.valuesById && rawGear in enumFields.gearState.valuesById) {
                     const valName = enumFields.gearState.valuesById[rawGear];
                     if (valName === "DRIVE") gearStr = "D";
@@ -1165,8 +1172,8 @@
                     else gearStr = "P";
                 }
 
-                isLeftBlinkerOn = !!(sei.blinkerOnLeft || sei.blinker_on_left);
-                isRightBlinkerOn = !!(sei.blinkerOnRight || sei.blinker_on_right);
+                isLeftBlinkerOn = !!sei.blinkerOnLeft;
+                isRightBlinkerOn = !!sei.blinkerOnRight;
                 blinkPhase = (isLeftBlinkerOn || isRightBlinkerOn) ? (Math.floor(currentTime * 3) % 2) : 0;
 
                 seiText = `${speedVal}|${accelNum}|${isBrakeOn}|${apState}|${gearStr}|${isLeftBlinkerOn}|${isRightBlinkerOn}|${blinkPhase}`;
@@ -1247,7 +1254,18 @@
         // 4. Upload Video Frame
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, videoTexture);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+        // texImage2D 每帧都会重新分配纹理存储，代价很高；
+        // 首次（或源尺寸变化时）分配一次，之后用 texSubImage2D 原地更新。
+        const srcW = sourceFrame ? (sourceFrame.displayWidth || sourceFrame.codedWidth) : source.videoWidth;
+        const srcH = sourceFrame ? (sourceFrame.displayHeight || sourceFrame.codedHeight) : source.videoHeight;
+        if (!videoTextureInitialized || videoTexWidth !== srcW || videoTexHeight !== srcH) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+            videoTextureInitialized = true;
+            videoTexWidth = srcW;
+            videoTexHeight = srcH;
+        } else {
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, source);
+        }
 
         // 5. Render WebGL Composite
         gl.useProgram(program);
@@ -1573,11 +1591,11 @@
         const capOk = checkCapabilities();
         const resOk = mergeAnalysis ? mergeAnalysis.resolutionOk : true;
         startRecBtn.disabled = !(capOk && resOk);
+        // 只要能合成（段数不限），状态就保持为「已就绪」，不追加段数/时间连续性等附加信息。
+        // 仅在无法合成时（分辨率不一致）才覆盖为错误提示——此时「开始合成」是禁用的，
+        // 显示「已就绪」会自相矛盾。
         if (!resOk) {
             statusText.textContent = '分辨率不一致：请仅导入同一摄像头视角的视频';
-        } else if (clips.length > 1) {
-            const gaps = mergeAnalysis.continuity.filter(c => c.status !== 'continuous' && c.status !== 'start');
-            statusText.textContent = `已导入 ${clips.length} 段` + (gaps.length ? ` · ${gaps.length} 处时间不连续` : ' · 时间连续');
         }
     };
 

@@ -40,8 +40,10 @@
 
         const protobuf = await getProtobuf();
         const enumFields = protobuf.enumFields;
-        const buffer = await file.arrayBuffer();
-        const parser = new DashcamMP4(buffer);
+        // 文件模式：不把整个视频读进内存，只加载 moov，样本数据在解析/合成时按需读取。
+        // 整包 arrayBuffer() 在多段导入时会直接撑爆移动端内存上限。
+        const parser = new DashcamMP4(file);
+        await parser.init();
         const parsedFrames = await parser.parseFrames(protobuf.SeiMetadata);
         const config = parser.getConfig();
         const samples = parser.getSamples();

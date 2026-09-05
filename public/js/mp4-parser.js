@@ -5,6 +5,26 @@
 
 const MP4_EPOCH_OFFSET = 2082844800;
 
+// 样本数据顺序预读块大小：解析与合成都是严格顺序访问，
+// 一次读取 1MB 可把「每帧一次文件 I/O」降为「每 1MB 一次」。
+const READ_CHUNK = 1 << 20;
+
+// 主线程让出工具：扫描整个视频的 SEI 是一次长时间同步循环，
+// 必须周期性让出主线程，否则 UI 会完全冻结（连状态提示都来不及渲染）。
+const _yieldQueue = [];
+const _yieldChannel = (typeof MessageChannel !== 'undefined') ? new MessageChannel() : null;
+if (_yieldChannel) {
+    _yieldChannel.port1.onmessage = () => {
+        const r = _yieldQueue.shift();
+        if (r) r();
+    };
+}
+const yieldToUi = () => {
+    if (!_yieldChannel) return new Promise(r => setTimeout(r, 0));
+    return new Promise(r => { _yieldQueue.push(r); _yieldChannel.port2.postMessage(null); });
+};
+const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
 class DashcamMP4 {
     /**
      * @param {Uint8Array|File|Blob|ArrayBuffer} source - Source video buffer or file handle.
@@ -19,23 +39,99 @@ class DashcamMP4 {
             this.sourceFile = source;
         }
 
+        // this.view 始终指向「box 解析视图」：
+        //   全量模式 = 整个文件；文件模式 = 仅 moov（由 init() 懒加载）
+        // this._boxData 是 view 对应的 Uint8Array，用于切片拷贝。
         if (this.buffer) {
             this.view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
+            this._boxData = this.buffer;
         } else {
             this.view = null;
+            this._boxData = null;
         }
 
         this._config = null;
         this._samples = null;
         this.isHEVC = false;
         this._reusableSeiBuf = new Uint8Array(65536);
-        this._sampleDataCache = new Map();
+
+        // 顺序预读缓冲（仅文件模式使用）
+        this._readBuf = null;
+        this._readStart = 0;
+        this._readEnd = 0;
     }
 
     attachSource(source) {
         if (source instanceof File || source instanceof Blob) {
             this.sourceFile = source;
         }
+    }
+
+    /**
+     * 文件模式初始化：只把 moov 读进内存（通常几十 KB ~ 数 MB），
+     * 样本数据留在磁盘上按需读取，避免整个视频常驻内存导致移动端 OOM。
+     * 全量模式（构造时传入 ArrayBuffer/Uint8Array）无需调用。
+     */
+    async init() {
+        if (this.view) return;
+        if (!this.sourceFile) throw new Error("缺少视频数据源");
+
+        const { start, end } = await this._locateMoov();
+        const buf = await this.sourceFile.slice(start, end).arrayBuffer();
+        this._boxData = new Uint8Array(buf);
+        this.view = new DataView(this._boxData.buffer);
+    }
+
+    /**
+     * 分块扫描顶层 box 链定位 moov。顶层 box 数量极少（ftyp/moov/free/mdat…），
+     * 因此只需读取文件头尾各一小块即可完成定位，无需加载整个文件。
+     */
+    async _locateMoov() {
+        const fileSize = this.sourceFile.size;
+        const CHUNK = 1 << 20;
+        let pos = 0;
+        let chunkStart = 0;
+        let chunk = null;
+        let chunkView = null;
+
+        while (pos + 8 <= fileSize) {
+            // 保证当前窗口内至少能读到一个完整的 box 头（含 64 位 largesize）
+            if (!chunk || pos < chunkStart || pos + 16 > chunkStart + chunk.byteLength) {
+                chunkStart = pos;
+                const end = Math.min(fileSize, pos + CHUNK);
+                chunk = new Uint8Array(await this.sourceFile.slice(pos, end).arrayBuffer());
+                chunkView = new DataView(chunk.buffer);
+            }
+
+            const rel = pos - chunkStart;
+            if (rel + 8 > chunk.byteLength) break;
+
+            let size = chunkView.getUint32(rel);
+            const type = this._ascii(chunk, rel + 4, 4);
+            let headerSize = 8;
+
+            if (size === 1) {
+                if (rel + 16 > chunk.byteLength) break;
+                const high = chunkView.getUint32(rel + 8);
+                const low = chunkView.getUint32(rel + 12);
+                size = Number((BigInt(high) << 32n) | BigInt(low));
+                headerSize = 16;
+            } else if (size === 0) {
+                size = fileSize - pos;
+            }
+
+            if (!Number.isFinite(size) || size < headerSize || pos + size > fileSize) break;
+
+            if (type === 'moov') return { start: pos + headerSize, end: pos + size };
+            pos += size;
+        }
+        throw new Error("未能在文件中定位 moov（文件可能已损坏或不是 MP4/MOV）");
+    }
+
+    _ascii(buf, start, len) {
+        let s = '';
+        for (let i = 0; i < len; i++) s += String.fromCharCode(buf[start + i]);
+        return s;
     }
 
     async readSampleData(offset, size) {
@@ -47,24 +143,37 @@ class DashcamMP4 {
             return null;
         }
 
-        const key = `${offset}:${size}`;
-        if (this._sampleDataCache.has(key)) {
-            return this._sampleDataCache.get(key);
+        // 顺序预读缓冲：解析与合成都是严格递增访问，命中率接近 100%。
+        // 原先的 LRU 缓存在顺序场景下命中率为 0，却会常驻若干最大样本，纯属浪费。
+        if (this._readBuf && offset >= this._readStart && offset + size <= this._readEnd) {
+            const rel = offset - this._readStart;
+            return this._readBuf.subarray(rel, rel + size);
         }
 
         try {
-            const slice = await this.sourceFile.slice(offset, offset + size).arrayBuffer();
-            const data = new Uint8Array(slice);
-            this._sampleDataCache.set(key, data);
-            if (this._sampleDataCache.size > 16) {
-                const firstKey = this._sampleDataCache.keys().next().value;
-                this._sampleDataCache.delete(firstKey);
+            // 文件被截断时不要返回残缺样本，否则会构造出无法解码的 EncodedVideoChunk
+            if (offset + size > this.sourceFile.size) {
+                console.warn('样本数据超出文件范围，已跳过');
+                return null;
             }
-            return data;
+            const want = Math.max(READ_CHUNK, size);
+            const end = Math.min(this.sourceFile.size, offset + want);
+            const slice = await this.sourceFile.slice(offset, end).arrayBuffer();
+            this._readBuf = new Uint8Array(slice);
+            this._readStart = offset;
+            this._readEnd = end;
+            return this._readBuf.subarray(0, size);
         } catch (error) {
             console.warn('Sample read failed:', error);
             return null;
         }
+    }
+
+    /** 释放顺序预读缓冲（合成结束后调用，避免残留 1MB 常驻） */
+    releaseReadBuffer() {
+        this._readBuf = null;
+        this._readStart = 0;
+        this._readEnd = 0;
     }
 
     findBox(start, end, name) {
@@ -103,8 +212,12 @@ class DashcamMP4 {
 
     getConfig() {
         if (this._config) return this._config;
+        if (!this.view) throw new Error("解析器尚未初始化，请先调用 init()");
 
-        const moov = this.findBox(0, this.view.byteLength, 'moov');
+        // 文件模式下 this.view 就是 moov 本身；全量模式需要从文件顶层定位 moov
+        const moov = this.buffer
+            ? this.findBox(0, this.view.byteLength, 'moov')
+            : { start: 0, end: this.view.byteLength, size: this.view.byteLength };
         let trakPos = moov.start;
 
         while (trakPos < moov.end) {
@@ -166,7 +279,7 @@ class DashcamMP4 {
                         width: this.view.getUint16(videoBoxEntry.start + 24),
                         height: this.view.getUint16(videoBoxEntry.start + 26),
                         codec, timescale, durations,
-                        description: new Uint8Array(this.buffer.subarray(descriptionBox.start, descriptionBox.start + descriptionBox.size)),
+                        description: new Uint8Array(this._boxData.subarray(descriptionBox.start, descriptionBox.start + descriptionBox.size)),
                         type, _stbl: stbl
                     };
                     return this._config;
@@ -244,6 +357,13 @@ class DashcamMP4 {
         let currentSample = 0;
         let currentTimeUs = 0;
         let stscCursor = 0;
+
+        // 共享的 loadData：长视频有数万个样本，若每个样本各自持有一个闭包，
+        // 会额外产生数万个函数对象。通过 this 绑定复用同一个函数。
+        const self = this;
+        const loadSampleData = function () {
+            return self.readSampleData(this.offset, this.size);
+        };
         let currentSamplesPerChunk = sampleToChunk.length > 0 ? sampleToChunk[0].samplesPerChunk : 1;
 
         for (let i = 0; i < chunkOffsets.length; i++) {
@@ -266,7 +386,7 @@ class DashcamMP4 {
                     duration: Math.round(durationMs * 1000),
                     type: keyframes.has(currentSample) ? 'key' : 'delta'
                 };
-                sampleObj.loadData = async () => this.readSampleData(sampleObj.offset, sampleObj.size);
+                sampleObj.loadData = loadSampleData;
                 samples.push(sampleObj);
 
                 offset += size;
@@ -280,7 +400,10 @@ class DashcamMP4 {
 
     getCreationTime() {
         try {
-            const moov = this.findBox(0, this.view.byteLength, 'moov');
+            if (!this.view) return null;
+            const moov = this.buffer
+                ? this.findBox(0, this.view.byteLength, 'moov')
+                : { start: 0, end: this.view.byteLength };
             const mvhd = this.findBox(moov.start, moov.end, 'mvhd');
             const version = this.view.getUint8(mvhd.start);
             const secondsSince1904 = version === 1
@@ -297,12 +420,15 @@ class DashcamMP4 {
     async parseFrames(SeiMetadata) {
         const frames = [];
         let pendingSei = null;
+        let lastYield = nowMs();
 
         const samples = this.getSamples();
-        for (const s of samples) {
+        for (let idx = 0; idx < samples.length; idx++) {
+            const s = samples[idx];
             const sampleBuf = this.buffer
                 ? this.buffer.subarray(s.offset, s.offset + s.size)
                 : await this.readSampleData(s.offset, s.size);
+            if (!sampleBuf || sampleBuf.byteLength < 4) continue;
 
             const dv = new DataView(sampleBuf.buffer, sampleBuf.byteOffset, sampleBuf.byteLength);
             let cursor = 0;
@@ -325,6 +451,13 @@ class DashcamMP4 {
                 }
                 cursor += len;
             }
+
+            // 每累积约 8ms 的同步扫描就让出一次主线程。这段循环要读完整个码流，
+            // 若不让出，UI 会长时间完全冻结，连"正在解析"提示都来不及渲染。
+            if ((idx & 15) === 15 && nowMs() - lastYield > 8) {
+                await yieldToUi();
+                lastYield = nowMs();
+            }
         }
         return frames;
     }
@@ -337,7 +470,24 @@ class DashcamMP4 {
         if (i <= 3 || i + 1 >= nal.length || nal[i] !== 0x69) return null;
 
         try {
-            return SeiMetadata.decode(this.stripEmulationBytes(nal.subarray(i + 1, nal.length - 1)));
+            const d = SeiMetadata.decode(this.stripEmulationBytes(nal.subarray(i + 1, nal.length - 1)));
+            if (!d) return null;
+
+            // 只保留绘制真正需要的字段。protobuf 的 Message 实例带有原型链和全部 16 个字段，
+            // 每个视频帧都保留一份会显著放大内存（数万帧 × 完整对象）。
+            // 同时把命名统一为驼峰，省去下游的兼容分支。
+            const rawGear = d.gearState !== undefined ? d.gearState : d.gear_state;
+            return {
+                // frameSeqNo 不是绘制字段，但 MergeManager 用它推导视频起始时间基准，必须保留
+                frameSeqNo: d.frameSeqNo,
+                vehicleSpeedMps: d.vehicleSpeedMps || 0,
+                autopilotState: d.autopilotState || 0,
+                brakeApplied: !!d.brakeApplied,
+                acceleratorPedalPosition: d.acceleratorPedalPosition || 0,
+                gearState: rawGear !== undefined ? rawGear : 0,
+                blinkerOnLeft: !!(d.blinkerOnLeft || d.blinker_on_left),
+                blinkerOnRight: !!(d.blinkerOnRight || d.blinker_on_right)
+            };
         } catch {
             return null;
         }

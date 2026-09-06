@@ -450,104 +450,37 @@
     };
 
     const patchMp4Metadata = (buffer, creationTime, location = null) => {
-        let workBuffer = buffer;
+        const workBuffer = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
+        const view = new DataView(workBuffer);
 
-        if (location && location.lat !== undefined && location.lon !== undefined) {
-            const isoStr = formatISO6709(location.lat, location.lon);
-            if (isoStr) {
-                const metaBox = buildLocationMetaBox(isoStr);
-                const udtaBox = buildLocationUdtaBox(isoStr);
-                const extraLength = metaBox.length + udtaBox.length;
-                const extraBytes = new Uint8Array(extraLength);
-                extraBytes.set(metaBox, 0);
-                extraBytes.set(udtaBox, metaBox.length);
+        let moovInfo = null;
+        let mdatInfo = null;
+        let pos = 0;
 
-                let view = new DataView(workBuffer);
-                let moovInfo = null;
-                let mdatInfo = null;
-
-                let pos = 0;
-                while (pos + 8 <= workBuffer.byteLength) {
-                    let boxSize = view.getUint32(pos);
-                    const boxType = view.getUint32(pos + 4);
-                    let headerSize = 8;
-                    if (boxSize === 1 && pos + 16 <= workBuffer.byteLength) {
-                        const high = view.getUint32(pos + 8);
-                        const low = view.getUint32(pos + 12);
-                        boxSize = Number((BigInt(high) << 32n) | BigInt(low));
-                        headerSize = 16;
-                    } else if (boxSize === 0) {
-                        boxSize = workBuffer.byteLength - pos;
-                    }
-                    if (boxSize < 8 || pos + boxSize > workBuffer.byteLength) break;
-
-                    if (boxType === 0x6D6F6F76) {
-                        moovInfo = { start: pos, end: pos + boxSize, size: boxSize, headerSize };
-                    } else if (boxType === 0x6D646174) {
-                        mdatInfo = { start: pos, size: boxSize };
-                    }
-                    pos += boxSize;
-                }
-
-                if (moovInfo) {
-                    const deltaSize = extraLength;
-                    const isMdatAfterMoov = mdatInfo && mdatInfo.start > moovInfo.start;
-
-                    if (isMdatAfterMoov) {
-                        const adjustChunkOffsets = (start, end) => {
-                            let offset = start;
-                            while (offset + 8 <= end) {
-                                const boxSize = view.getUint32(offset);
-                                const boxType = view.getUint32(offset + 4);
-                                if (boxSize < 8 || offset + boxSize > end) break;
-
-                                if (boxType === 0x7374636F) {
-                                    const entryCount = view.getUint32(offset + 12);
-                                    for (let i = 0; i < entryCount; i++) {
-                                        const entryOffset = offset + 16 + i * 4;
-                                        if (entryOffset + 4 <= end) {
-                                            const oldVal = view.getUint32(entryOffset);
-                                            view.setUint32(entryOffset, oldVal + deltaSize);
-                                        }
-                                    }
-                                } else if (boxType === 0x636F3634) {
-                                    const entryCount = view.getUint32(offset + 12);
-                                    for (let i = 0; i < entryCount; i++) {
-                                        const entryOffset = offset + 16 + i * 8;
-                                        if (entryOffset + 8 <= end) {
-                                            const oldVal = view.getBigUint64(entryOffset);
-                                            view.setBigUint64(entryOffset, oldVal + BigInt(deltaSize));
-                                        }
-                                    }
-                                } else if (
-                                    boxType === 0x6D6F6F76 ||
-                                    boxType === 0x7472616B ||
-                                    boxType === 0x6D646961 ||
-                                    boxType === 0x6D696E66 ||
-                                    boxType === 0x7374626C
-                                ) {
-                                    adjustChunkOffsets(offset + 8, offset + boxSize);
-                                }
-                                offset += boxSize;
-                            }
-                        };
-                        adjustChunkOffsets(moovInfo.start + moovInfo.headerSize, moovInfo.end);
-                    }
-
-                    view.setUint32(moovInfo.start, moovInfo.size + deltaSize);
-
-                    const newBuffer = new Uint8Array(workBuffer.byteLength + deltaSize);
-                    newBuffer.set(new Uint8Array(workBuffer, 0, moovInfo.end), 0);
-                    newBuffer.set(extraBytes, moovInfo.end);
-                    newBuffer.set(new Uint8Array(workBuffer, moovInfo.end), moovInfo.end + deltaSize);
-
-                    workBuffer = newBuffer.buffer;
-                }
+        while (pos + 8 <= workBuffer.byteLength) {
+            let boxSize = view.getUint32(pos);
+            const boxType = view.getUint32(pos + 4);
+            let headerSize = 8;
+            if (boxSize === 1 && pos + 16 <= workBuffer.byteLength) {
+                const high = view.getUint32(pos + 8);
+                const low = view.getUint32(pos + 12);
+                boxSize = Number((BigInt(high) << 32n) | BigInt(low));
+                headerSize = 16;
+            } else if (boxSize === 0) {
+                boxSize = workBuffer.byteLength - pos;
             }
+            if (boxSize < 8 || pos + boxSize > workBuffer.byteLength) break;
+
+            if (boxType === 0x6D6F6F76) {
+                moovInfo = { start: pos, end: pos + boxSize, size: boxSize, headerSize };
+            } else if (boxType === 0x6D646174) {
+                mdatInfo = { start: pos, size: boxSize };
+            }
+            pos += boxSize;
         }
 
+        // 1. 原位修补创建时间（mvhd, tkhd, mdhd 均位于 moov 内部，仅扫描 moov 结构大幅减少开销）
         if (creationTime) {
-            const view = new DataView(workBuffer);
             const bigCreationTime = BigInt(creationTime);
             const targets = new Set([0x6D766864, 0x746B6864, 0x6D646864]);
             const containers = new Set([
@@ -562,9 +495,19 @@
             const patchBoxes = (start, end) => {
                 let offset = start;
                 while (offset + 8 <= end) {
-                    const boxSize = view.getUint32(offset);
+                    let boxSize = view.getUint32(offset);
                     const boxType = view.getUint32(offset + 4);
-                    if (boxSize < 8 || offset + boxSize > end) break;
+                    let headerSize = 8;
+                    if (boxSize === 1 && offset + 16 <= end) {
+                        const high = view.getUint32(offset + 8);
+                        const low = view.getUint32(offset + 12);
+                        boxSize = Number((BigInt(high) << 32n) | BigInt(low));
+                        headerSize = 16;
+                    } else if (boxSize === 0) {
+                        boxSize = end - offset;
+                    }
+                    if (boxSize < headerSize || offset + boxSize > end) break;
+
                     if (targets.has(boxType)) {
                         const version = view.getUint8(offset + 8);
                         const dataOffset = offset + 12;
@@ -578,14 +521,108 @@
                             view.setBigUint64(dataOffset + 8, bigCreationTime);
                         }
                     } else if (containers.has(boxType)) {
-                        patchBoxes(offset + 8, offset + boxSize);
+                        patchBoxes(offset + headerSize, offset + boxSize);
                     }
                     offset += boxSize;
                 }
             };
-            patchBoxes(0, workBuffer.byteLength);
+
+            if (moovInfo) {
+                patchBoxes(moovInfo.start + moovInfo.headerSize, moovInfo.end);
+            } else {
+                patchBoxes(0, workBuffer.byteLength);
+            }
         }
-        return workBuffer;
+
+        // 2. 原位修补 GPS 地理坐标元数据（直接在原 buffer 上更新 moov 尺寸与 chunk offsets）
+        let extraBytes = null;
+        if (location && location.lat !== undefined && location.lon !== undefined && moovInfo) {
+            const isoStr = formatISO6709(location.lat, location.lon);
+            if (isoStr) {
+                const metaBox = buildLocationMetaBox(isoStr);
+                const udtaBox = buildLocationUdtaBox(isoStr);
+                const extraLength = metaBox.length + udtaBox.length;
+                extraBytes = new Uint8Array(extraLength);
+                extraBytes.set(metaBox, 0);
+                extraBytes.set(udtaBox, metaBox.length);
+
+                const deltaSize = extraLength;
+                const isMdatAfterMoov = mdatInfo && mdatInfo.start > moovInfo.start;
+
+                if (isMdatAfterMoov) {
+                    const adjustChunkOffsets = (start, end) => {
+                        let offset = start;
+                        while (offset + 8 <= end) {
+                            let boxSize = view.getUint32(offset);
+                            const boxType = view.getUint32(offset + 4);
+                            let headerSize = 8;
+                            if (boxSize === 1 && offset + 16 <= end) {
+                                const high = view.getUint32(offset + 8);
+                                const low = view.getUint32(offset + 12);
+                                boxSize = Number((BigInt(high) << 32n) | BigInt(low));
+                                headerSize = 16;
+                            } else if (boxSize === 0) {
+                                boxSize = end - offset;
+                            }
+                            if (boxSize < headerSize || offset + boxSize > end) break;
+
+                            if (boxType === 0x7374636F) {
+                                const entryCount = view.getUint32(offset + 12);
+                                for (let i = 0; i < entryCount; i++) {
+                                    const entryOffset = offset + 16 + i * 4;
+                                    if (entryOffset + 4 <= end) {
+                                        const oldVal = view.getUint32(entryOffset);
+                                        view.setUint32(entryOffset, oldVal + deltaSize);
+                                    }
+                                }
+                            } else if (boxType === 0x636F3634) {
+                                const entryCount = view.getUint32(offset + 12);
+                                for (let i = 0; i < entryCount; i++) {
+                                    const entryOffset = offset + 16 + i * 8;
+                                    if (entryOffset + 8 <= end) {
+                                        const oldVal = view.getBigUint64(entryOffset);
+                                        view.setBigUint64(entryOffset, oldVal + BigInt(deltaSize));
+                                    }
+                                }
+                            } else if (
+                                boxType === 0x6D6F6F76 ||
+                                boxType === 0x7472616B ||
+                                boxType === 0x6D646961 ||
+                                boxType === 0x6D696E66 ||
+                                boxType === 0x7374626C
+                            ) {
+                                adjustChunkOffsets(offset + headerSize, offset + boxSize);
+                            }
+                            offset += boxSize;
+                        }
+                    };
+                    adjustChunkOffsets(moovInfo.start + moovInfo.headerSize, moovInfo.end);
+                }
+
+                // 原位更新 moov 大小
+                view.setUint32(moovInfo.start, moovInfo.size + deltaSize);
+            }
+        }
+
+        // 3. 组装零拷贝 Blob（杜绝创建双倍超大 ArrayBuffer 避免移动端 OOM）
+        let blobParts;
+        if (extraBytes && moovInfo) {
+            if (moovInfo.end >= workBuffer.byteLength) {
+                // moov 位于文件末尾（fastStart: false 默认模式），直接拼接原 buffer 与尾部追加字节
+                blobParts = [workBuffer, extraBytes];
+            } else {
+                // moov 位于文件前端（fastStart: true 模式），使用 Uint8Array 零拷贝视图切片
+                blobParts = [
+                    new Uint8Array(workBuffer, 0, moovInfo.end),
+                    extraBytes,
+                    new Uint8Array(workBuffer, moovInfo.end)
+                ];
+            }
+        } else {
+            blobParts = [workBuffer];
+        }
+
+        return new Blob(blobParts, { type: 'video/mp4' });
     };
 
     let muxer = null, encoder = null, mediaRecorder = null, mediaRecorderStopPromise = null, frameCount = 0;
@@ -1043,10 +1080,9 @@
             const { buffer } = muxer.target;
             // 立即切断 muxer 对完整输出 MP4（可达数百 MB）的引用，否则模块级变量会
             // 把它一直钉在堆上直到下次合成，连续导出极易 OOM。
-            // 数据本身由 finalBuffer → finalBlob → blob URL 独立持有，释放是安全的。
+            // 数据本身由 finalBlob → blob URL 独立持有，释放是安全的。
             muxer = null;
-            let finalBuffer = patchMp4Metadata(buffer, originalMediaDate, eventLocation);
-            let finalBlob = new Blob([finalBuffer], { type: 'video/mp4' });
+            const finalBlob = patchMp4Metadata(buffer, originalMediaDate, eventLocation);
             const file = new File([finalBlob], `${vidName}_stamp.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
             const url = URL.createObjectURL(file);
             const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();

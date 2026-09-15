@@ -3,10 +3,11 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tesla Dashcam Stamp</title>
     <link rel="manifest" href="manifest.json">
     <link rel="icon" type="image/png" href="icon.png">
+    <link rel="apple-touch-icon" href="icon.png">
     <link rel="stylesheet" href="public/css/style.css">
 
     <!-- External Libraries -->
@@ -47,7 +48,7 @@
                 </svg>
             </div>
             <p id="uploadPrompt">选择原始视频文件</p>
-            <input class="inputer" type="file" accept="video/*,.json,application/json" multiple id="fileInput" />
+            <input class="inputer" type="file" accept="video/*,.json,application/json" multiple id="fileInput" aria-label="选择原始视频文件" title="选择原始视频文件" />
         </section>
 
         <div class="viewer" id="videoViewer">
@@ -76,7 +77,7 @@
                         </svg>
                     </button>
                     <div class="slider-container">
-                        <input class="timeLine" type="range" min="0" max="1000" step="1" value="0" id="timeSlider" />
+                        <input class="timeLine" type="range" min="0" max="1000" step="1" value="0" id="timeSlider" aria-label="视频播放进度" title="视频播放进度" />
                     </div>
                 </div>
 

@@ -78,8 +78,8 @@ body {
 
 .card {
     background: var(--card-bg);
-    backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
+    backdrop-filter: blur(20px);
     border: 1px solid var(--glass-border);
     border-radius: 16px;
     padding: 6px 12px 6px 12px;
@@ -152,8 +152,8 @@ body {
 .upload-zone {
     position: relative;
     background: var(--card-bg);
-    backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
+    backdrop-filter: blur(20px);
     border: 2px dashed var(--glass-border);
     border-radius: 24px;
     padding: 60px 20px;
@@ -272,6 +272,7 @@ canvas {
     height: 26px;
     padding: 0 14px;
     background: rgba(255, 255, 255, 0.05);
+    -webkit-backdrop-filter: blur(10px);
     backdrop-filter: blur(10px);
     border-radius: 20px;
     color: var(--text-secondary);
@@ -294,8 +295,8 @@ canvas {
     align-items: center;
     justify-content: center;
     line-height: 1;
-    backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
     font-weight: 600;
     letter-spacing: 0.5px;
 }
@@ -443,6 +444,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
     background: rgba(255, 255, 255, 0.05);
     color: white;
     border: 1px solid var(--glass-border);
+    -webkit-backdrop-filter: blur(10px);
     backdrop-filter: blur(10px);
 }
 
@@ -492,8 +494,8 @@ input[type="range"]::-webkit-slider-thumb:hover {
     border: 1px solid var(--glass-border);
     border-radius: 22px;
     padding: 3px;
-    backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
 }
 
 .lang-indicator {
@@ -503,8 +505,8 @@ input[type="range"]::-webkit-slider-thumb:hover {
     height: calc(100% - 6px);
     border-radius: 18px;
     background: rgba(255, 255, 255, 0.13);
-    backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
     box-shadow: 0 1px 10px rgba(0, 0, 0, 0.4),
         inset 0 1px 0 rgba(255, 255, 255, 0.15);
     border: 1px solid rgba(255, 255, 255, 0.15);
@@ -530,8 +532,8 @@ input[type="range"]::-webkit-slider-thumb:hover {
     transition: color 0.38s cubic-bezier(0.16, 1, 0.3, 1);
     position: relative;
     z-index: 1;
-    user-select: none;
     -webkit-user-select: none;
+    user-select: none;
 }
 
 .lang-option:hover {

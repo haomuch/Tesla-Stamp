@@ -180,7 +180,6 @@
     let cachedCanvasWidth = -1;
     let cachedCanvasHeight = -1;
     let cachedFontSize = 0;
-    let cachedTextWidth = 0;
     let cachedLayout = null;
     let cachedSingleDigitWidth = 0;
     let textTextureInitialized = false;
@@ -273,28 +272,44 @@
         return rounded % 2 === 0 ? rounded : rounded + 1;
     };
 
-    const getInfoBarHeight = (width) => makeEvenDimension(Math.max(36, Math.ceil(width / 40 * 2)));
-    const getCompositeLayout = (videoWidth, videoHeight) => {
-        const splitBelow = (videoWidth / videoHeight) > 1.5;
-        const barHeight = getInfoBarHeight(videoWidth);
-        const compositeHeight = splitBelow ? videoHeight + barHeight : videoHeight;
-        return {
-            width: makeEvenDimension(videoWidth),
-            height: makeEvenDimension(compositeHeight),
-            splitBelow,
-            barHeight
-        };
+    const fontStack = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+    const BAR_MIN_HEIGHT = 36;
+
+    /**
+     * 信息栏字号 / 高度的唯一算法。
+     * 布局阶段（getCompositeLayout 预留画布高度）与绘制阶段（drawFrame 生成文字纹理）
+     * 必须共用同一结果：此前二者各算一套（width/20 vs. 按字体实测放大后的 fontSize*2），
+     * 拆分模式下只要字体度量与假设不符，视频区就会被拉伸/压缩若干像素或多出黑边。
+     */
+    const computeBarMetrics = (canvasWidth) => {
+        let fontSize = canvasWidth / 40;
+        textCtx.font = `400 ${fontSize}px ${fontStack}`;
+        const testString = "0000-00-00 00:00:00";
+        const initialWidth = textCtx.measureText(testString).width;
+        const targetWidth = canvasWidth * 0.285;
+        if (initialWidth > 0 && initialWidth < targetWidth) {
+            fontSize *= (targetWidth / initialWidth);
+        }
+        const barHeight = makeEvenDimension(Math.max(BAR_MIN_HEIGHT, Math.ceil(fontSize * 2)));
+        return { fontSize, barHeight };
     };
 
     const EXPORT_MAX_WIDTH = 1920;
-    const getScaledCompositeLayout = (videoWidth, videoHeight, maxWidth) => {
-        const base = getCompositeLayout(videoWidth, videoHeight);
-        const scale = maxWidth > 0 && base.width > maxWidth ? maxWidth / base.width : 1;
+    /**
+     * 计算合成画布布局。maxWidth > 0 时按比例降采样（导出用）。
+     * 先确定最终画布宽度，再用该宽度求条高，保证与 drawFrame 中 computeBarMetrics(cvs.width) 完全一致。
+     */
+    const getCompositeLayout = (videoWidth, videoHeight, maxWidth = 0) => {
+        const splitBelow = (videoWidth / videoHeight) > 1.5;
+        const scale = maxWidth > 0 && videoWidth > maxWidth ? maxWidth / videoWidth : 1;
+        const width = makeEvenDimension(videoWidth * scale);
+        const frameHeight = makeEvenDimension(videoHeight * scale);
+        const barHeight = computeBarMetrics(width).barHeight;
         return {
-            width: makeEvenDimension(base.width * scale),
-            height: makeEvenDimension(base.height * scale),
-            splitBelow: base.splitBelow,
-            barHeight: makeEvenDimension(base.barHeight * scale)
+            width,
+            height: splitBelow ? frameHeight + barHeight : frameHeight,
+            splitBelow,
+            barHeight
         };
     };
 
@@ -348,15 +363,31 @@
         return [gcjLat - dLat, gcjLon - dLon];
     };
 
+    /**
+     * event.json 的坐标系设置。
+     * Tesla 中国大陆车机记录的是国测局 GCJ-02 火星坐标：iOS 相册会把它当作 WGS-84 再叠加一次
+     * 国内地图偏转，出现 100~200 米的二次加偏，因此默认反算为 WGS-84 后再写入 MP4。
+     * 但 gcj02ToWgs84 的"境内"判定只是一个粗略经纬度矩形，港澳台、日韩、东南亚等地区同样落在
+     * 矩形内；这些地区的车机若记录的本就是 WGS-84，转换反而会把坐标偏离 100~500 米。
+     * 故提供开关（默认沿用 GCJ-02 行为）：localStorage.setItem('tesla_dashcam_gps_coord', 'wgs84')
+     */
+    const GPS_COORD_STORAGE_KEY = 'tesla_dashcam_gps_coord';
+    const getGpsCoordSystem = () => {
+        try {
+            return localStorage.getItem(GPS_COORD_STORAGE_KEY) === 'wgs84' ? 'wgs84' : 'gcj02';
+        } catch (e) {
+            return 'gcj02';
+        }
+    };
+
     const formatISO6709 = (lat, lon) => {
         let latNum = typeof lat === 'number' ? lat : parseFloat(lat);
         let lonNum = typeof lon === 'number' ? lon : parseFloat(lon);
         if (isNaN(latNum) || isNaN(lonNum)) return null;
 
-        // Tesla 国内车机 event.json 记录的是国测局 GCJ-02 火星坐标。
-        // iOS 相册读取元数据时默认将其视作 WGS-84 并自动叠加国内高德地图的火星偏转（WGS84 -> GCJ02）。
-        // 因此在此逆向转换为 WGS-84，使 iOS 地图还原时精准落到真实位置，避免 100~200 米的二次加偏。
-        const [wgsLat, wgsLon] = gcj02ToWgs84(latNum, lonNum);
+        const [wgsLat, wgsLon] = getGpsCoordSystem() === 'gcj02'
+            ? gcj02ToWgs84(latNum, lonNum)
+            : [latNum, lonNum];
 
         const latSign = wgsLat >= 0 ? '+' : '-';
         const lonSign = wgsLon >= 0 ? '+' : '-';
@@ -629,7 +660,13 @@
     let exportWidth = 0;
     let exportHeight = 0;
     let onEncoderError = null;
-    const checkCapabilities = () => !!(typeof Mp4Muxer !== 'undefined' && window.VideoEncoder && window.VideoFrame);
+    // 合成链路 = VideoDecoder 解码 → WebGL 叠加 → VideoEncoder 编码 → Mp4Muxer 封装，缺一不可。
+    // 此前未检查 WebGL 与 VideoDecoder：无 WebGL 时 drawFrame 直接返回，仍可点击合成并导出全黑视频。
+    const checkCapabilities = () => !!(
+        hasWebGL &&
+        typeof Mp4Muxer !== 'undefined' &&
+        window.VideoDecoder && window.VideoEncoder && window.VideoFrame
+    );
 
     applyLang(true);
 
@@ -671,7 +708,7 @@
         const exportFps = (typeof framerate === 'number' && framerate > 0) ? framerate : fps;
 
         if (!supportsWebCodecs) {
-            const layout = getScaledCompositeLayout(
+            const layout = getCompositeLayout(
                 srcWidth != null ? srcWidth : (vid ? vid.videoWidth : 0),
                 srcHeight != null ? srcHeight : (vid ? vid.videoHeight : 0),
                 EXPORT_MAX_WIDTH
@@ -730,7 +767,7 @@
 
         const inWidth = srcWidth != null ? srcWidth : (vid ? vid.videoWidth : 0);
         const inHeight = srcHeight != null ? srcHeight : (vid ? vid.videoHeight : 0);
-        const layout = getScaledCompositeLayout(inWidth, inHeight, EXPORT_MAX_WIDTH);
+        const layout = getCompositeLayout(inWidth, inHeight, EXPORT_MAX_WIDTH);
         exportWidth = layout.width;
         exportHeight = layout.height;
         compositeSplitBelow = layout.splitBelow;
@@ -810,7 +847,13 @@
             // 首段帧率即本次合成的基准帧率，编码器配置与 PTS 计算共用同一个值
             const activeFps = (refClip.fps > 10 && refClip.fps < 100) ? refClip.fps : 36;
             startRecBtn.disabled = true;
+            // 「正在准备」对应的是 initRecorder 里的编码器能力探测（多次 await），必须在其之前显示；
+            // 此前它被放在 initRecorder 之后并被下一行的「正在合成」同步覆盖，从未真正绘制过。
+            currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
+            updateStatus(t('statusPreparing'), true);
             if (!(await initRecorder(isHEVC, refClip.config.width, refClip.config.height, activeFps))) {
+                currentStatusKey = 'statusReady'; currentStatusArg = null; currentStatusIsRec = false;
+                updateStatus(t('statusReady'));
                 updateStartButtonState();
                 return;
             }
@@ -859,9 +902,6 @@
             };
             const waitForFrameProcessed = () => new Promise(r => { frameProcessedResolve = r; });
 
-            currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
-            updateStatus(t('statusPreparing'), true);
-
             const frameDurationUs = Math.round(1000000 / activeFps);
             const keyframeInterval = Math.max(1, Math.round(activeFps / 2));
 
@@ -898,7 +938,9 @@
                         output: (frame) => {
                             pendingFramesCount++;
                             try {
-                                if (!isRecording) { frame.close(); pendingFramesCount--; frameProcessedSignal(); return; }
+                                // 已停止：直接丢帧。close / 计数 / 信号统一交给 finally，
+                                // 此前这里手动做了一遍、finally 又做一遍，导致 pendingFramesCount 被双重递减变负。
+                                if (!isRecording) return;
                                 const timeSec = frame.timestamp / 1000000;
                                 if (timeSec >= skipBefore) {
                                     drawFrame(timeSec, frame);
@@ -984,6 +1026,13 @@
                         }
 
                         const sampleData = await s.loadData();
+                        // 文件被截断时 readSampleData 返回 null（样本越过 EOF）。样本按文件偏移递增，
+                        // 首个越界样本之后的全部样本必然也越界，故直接结束本段，保留已解码内容；
+                        // 此前会把 null 塞给 EncodedVideoChunk 抛出 TypeError，整次合成失败。
+                        if (!sampleData) {
+                            console.warn(`样本 #${i} 超出文件范围，本段提前结束`);
+                            break;
+                        }
                         decoder.decode(new EncodedVideoChunk({
                             type: s.type,
                             timestamp: s.timestamp,
@@ -1038,7 +1087,7 @@
                 cachedCanvasHeight = -1;
                 textTextureInitialized = false;
             }
-            startRecBtn.disabled = false;
+            updateStartButtonState();
             stopRecBtn.disabled = true;
             playPauseBtn.disabled = false;
             timeSlider.disabled = false;
@@ -1047,61 +1096,81 @@
         }
     };
 
+    // 停止/导出去重锁：encoder.flush() 最长可等 30s，此前「保存视频」按钮直到函数末尾才禁用，
+    // 期间重复点击（或合成自然结束时的自动调用与手动点击重叠）会二次进入，重复刷状态、重复起定时器。
+    let stopInProgress = false;
     const stopRecording = async () => {
+        if (stopInProgress) return;
+        stopInProgress = true;
+        stopRecBtn.disabled = true;
         isRecording = false;
         currentStatusKey = 'statusExporting'; currentStatusArg = null; currentStatusIsRec = false;
         updateStatus(t('statusExporting'));
-        if (encoder && encoder.state !== 'closed') {
-            try {
-                await Promise.race([
-                    encoder.flush(),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('Encoder flush timeout')), 30000))
-                ]);
-            } catch (e) {
-                console.warn('Encoder flush 超时或出错，强制关闭:', e.message);
-            }
-            if (encoder.state !== 'closed') encoder.close();
-        }
-        if (mediaRecorder) {
-            await new Promise((resolve, reject) => {
-                if (mediaRecorder.state === 'recording') {
-                    mediaRecorderStopPromise = { resolve, reject };
-                    mediaRecorder.stop();
-                } else {
-                    resolve();
+        try {
+            if (encoder && encoder.state !== 'closed') {
+                try {
+                    await Promise.race([
+                        encoder.flush(),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('Encoder flush timeout')), 30000))
+                    ]);
+                } catch (e) {
+                    console.warn('Encoder flush 超时或出错，强制关闭:', e.message);
                 }
-            }).catch((e) => {
-                console.warn('MediaRecorder stop failed:', e);
-            });
-            mediaRecorder = null;
-        }
-        if (muxer) {
-            muxer.finalize();
-            const { buffer } = muxer.target;
-            // 立即切断 muxer 对完整输出 MP4（可达数百 MB）的引用，否则模块级变量会
-            // 把它一直钉在堆上直到下次合成，连续导出极易 OOM。
-            // 数据本身由 finalBlob → blob URL 独立持有，释放是安全的。
+                if (encoder.state !== 'closed') encoder.close();
+            }
+            if (mediaRecorder) {
+                await new Promise((resolve, reject) => {
+                    if (mediaRecorder.state === 'recording') {
+                        mediaRecorderStopPromise = { resolve, reject };
+                        mediaRecorder.stop();
+                    } else {
+                        resolve();
+                    }
+                }).catch((e) => {
+                    console.warn('MediaRecorder stop failed:', e);
+                });
+                mediaRecorder = null;
+            }
+            if (muxer) {
+                muxer.finalize();
+                const { buffer } = muxer.target;
+                // 立即切断 muxer 对完整输出 MP4（可达数百 MB）的引用，否则模块级变量会
+                // 把它一直钉在堆上直到下次合成，连续导出极易 OOM。
+                // 数据本身由 finalBlob → blob URL 独立持有，释放是安全的。
+                muxer = null;
+                const finalBlob = patchMp4Metadata(buffer, originalMediaDate, eventLocation);
+                const file = new File([finalBlob], `${vidName}_stamp.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
+                const url = URL.createObjectURL(file);
+                const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
+                setTimeout(() => { URL.revokeObjectURL(url); currentStatusKey = 'statusDone'; currentStatusArg = null; currentStatusIsRec = false; updateStatus(t('statusDone')); }, 1000);
+            }
+        } catch (e) {
+            // finalize / 元数据修补失败：必须在此处收尾，否则手动点击「保存视频」触发的失败
+            // 不会经过 startRecording 的 catch，状态会永远停在「正在导出...」
+            console.error("Export error:", e);
             muxer = null;
-            const finalBlob = patchMp4Metadata(buffer, originalMediaDate, eventLocation);
-            const file = new File([finalBlob], `${vidName}_stamp.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
-            const url = URL.createObjectURL(file);
-            const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
-            setTimeout(() => { URL.revokeObjectURL(url); currentStatusKey = 'statusDone'; currentStatusArg = null; currentStatusIsRec = false; updateStatus(t('statusDone')); }, 1000);
+            currentStatusKey = 'statusError'; currentStatusArg = e.message; currentStatusIsRec = false;
+            updateStatus(t('statusError', e.message));
+        } finally {
+            if (encoder) {
+                try { if (encoder.state !== 'closed') encoder.close(); } catch (_) { }
+                encoder = null;
+            }
+            if (vid) {
+                const layout = getCompositeLayout(vid.videoWidth, vid.videoHeight);
+                cvs.width = layout.width;
+                cvs.height = layout.height;
+                compositeSplitBelow = layout.splitBelow;
+                cachedCanvasWidth = -1;
+                cachedCanvasHeight = -1;
+                textTextureInitialized = false;
+            }
+            // 释放各片段解析器的顺序预读缓冲（每个最多 1MB）
+            for (const c of clips) { if (c.parser) c.parser.releaseReadBuffer(); }
+            stopInProgress = false;
+            updateStartButtonState(); stopRecBtn.disabled = true;
+            playPauseBtn.disabled = false; timeSlider.disabled = false;
         }
-        if (vid) {
-            const layout = getCompositeLayout(vid.videoWidth, vid.videoHeight);
-            cvs.width = layout.width;
-            cvs.height = layout.height;
-            compositeSplitBelow = layout.splitBelow;
-            cachedCanvasWidth = -1;
-            cachedCanvasHeight = -1;
-            textTextureInitialized = false;
-        }
-        encoder = null;
-        // 释放各片段解析器的顺序预读缓冲（每个最多 1MB）
-        for (const c of clips) { if (c.parser) c.parser.releaseReadBuffer(); }
-        startRecBtn.disabled = false; stopRecBtn.disabled = true;
-        playPauseBtn.disabled = false; timeSlider.disabled = false;
     };
 
     // --- WebGL Render Loop ---
@@ -1112,7 +1181,6 @@
 
         const currentTime = forcedTime ?? vid.currentTime;
         const ctx = currentClipContext || { videoStartTime, parsedFrames, fps };
-        const fontStack = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
 
         // 1. Sync dimensions & Text Canvas sizing
         if (cvs.width !== cachedCanvasWidth || cvs.height !== cachedCanvasHeight) {
@@ -1120,28 +1188,15 @@
             cachedCanvasHeight = cvs.height;
             gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
 
-            let fontSize = cvs.width / 40;
-            textCtx.font = `400 ${fontSize}px ${fontStack}`;
-
-            const testString = "0000-00-00 00:00:00";
-            const initialWidth = textCtx.measureText(testString).width;
-            const targetWidthRatio = 0.285;
-            const targetWidth = cvs.width * targetWidthRatio;
-
-            if (initialWidth > 0 && initialWidth < targetWidth) {
-                fontSize *= (targetWidth / initialWidth);
-                textCtx.font = `400 ${fontSize}px ${fontStack}`;
-            }
+            // 与 getCompositeLayout 共用同一算法，保证绘制条高 == 布局预留条高
+            const { fontSize, barHeight } = computeBarMetrics(cvs.width);
             cachedFontSize = fontSize;
-
-            const bgH = Math.ceil(cachedFontSize * 2);
             textCanvas.width = cvs.width;
-            textCanvas.height = bgH;
-            compositeBarHeight = bgH;
+            textCanvas.height = barHeight;
+            compositeBarHeight = barHeight;
 
             textCtx.font = `400 ${fontSize}px ${fontStack}`;
             textCtx.textBaseline = 'middle';
-            cachedTextWidth = textCtx.measureText(testString).width;
             cachedSingleDigitWidth = textCtx.measureText("0").width;
 
             textCtx.font = `700 ${fontSize}px ${fontStack}`;
@@ -1395,8 +1450,9 @@
         fps = clip.fps;
         firstKeyFrameTime = clip.firstKeyFrameTime;
         firstPlayLock = !autoPlay;
-        vidName = clip.name;
-        originalFileLastModified = clip.lastModified;
+        // 注意：vidName / originalFileLastModified 是「输出文件」的元信息，只由 handleFiles 依据首段设置一次；
+        // 此处不可按预览段覆盖，否则输出文件名与 lastModified 会随「最后预览的是哪一段」而变，
+        // 且 handleFiles 刚拼好的 _merged 后缀会被立刻抹掉。
         enumFields = clip.enumFields;
         currentClipContext = clip;
         previewClipIndex = clips.indexOf(clip);
@@ -1560,8 +1616,12 @@
             if (isVideo) videoFiles.push(f);
             else if (isJson && !jsonFile) jsonFile = f;
         }
+        // 文件已取出，立即清空 input：否则解析失败后重新选择同一文件不会触发 change 事件
+        fileInput.value = "";
 
-        // event.json 坐标（合并后写入首段元数据）
+        // event.json 坐标（合并后写入首段元数据）。先记住旧值：新一批视频若全部解析失败，
+        // 保留的仍是旧片段，坐标也应随之回退，避免把失败批次的坐标写进旧视频。
+        const prevLocation = eventLocation;
         if (jsonFile) {
             try {
                 const text = await jsonFile.text();
@@ -1570,7 +1630,7 @@
                 const lon = data.est_lon !== undefined ? data.est_lon : data.longitude;
                 if (lat !== undefined && lon !== undefined && !isNaN(parseFloat(lat)) && !isNaN(parseFloat(lon))) {
                     eventLocation = { lat: parseFloat(lat), lon: parseFloat(lon) };
-                    console.log("已成功读取 event.json 坐标:", eventLocation);
+                    console.log("已成功读取 event.json 坐标:", eventLocation, "坐标系:", getGpsCoordSystem());
                 } else {
                     eventLocation = null;
                 }
@@ -1602,8 +1662,11 @@
             }
         }
         if (parsed.length === 0) {
-            currentStatusKey = 'statusError'; currentStatusArg = '解析失败'; currentStatusIsRec = false;
-            updateStatus(t('statusError', '没有可解析的视频'));
+            // 拖放区此时已隐藏，因此错误态必须能显示「更换视频」（见 i18n.js reselectKeys），
+            // 否则用户只能刷新页面。旧片段（若有）原样保留，可继续预览/合成。
+            eventLocation = prevLocation;
+            currentStatusKey = 'statusParseError'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusParseError'));
             return;
         }
 
@@ -1612,13 +1675,14 @@
         mergeAnalysis = MergeManager.analyzeClips(clips);
         computeMergedTimeline();
 
+        // 输出文件的元信息一律取自首段（时间基准 / 文件名 / lastModified），与预览到哪一段无关
         originalMediaDate = Math.floor(clips[0].videoStartTime / 1000) + MP4_EPOCH_OFFSET;
         vidName = clips[0].name + (clips.length > 1 ? '_merged' : '');
+        originalFileLastModified = clips[0].lastModified;
         targetBitrate = clips[0].targetBitrate;
         currentClipContext = clips[0];
 
         await setupPreview(clips[0]);
-        fileInput.value = "";
         updateStartButtonState();
     };
 
@@ -1628,10 +1692,17 @@
         const resOk = mergeAnalysis ? mergeAnalysis.resolutionOk : true;
         startRecBtn.disabled = !(capOk && resOk);
         // 只要能合成（段数不限），状态就保持为「已就绪」，不追加段数/时间连续性等附加信息。
-        // 仅在无法合成时（分辨率不一致）才覆盖为错误提示——此时「开始合成」是禁用的，
-        // 显示「已就绪」会自相矛盾。
+        // 仅在无法合成时才覆盖为对应提示——此时「开始合成」是禁用的，显示「已就绪」会自相矛盾。
+        // 必须走 currentStatusKey 状态机而不是直接写 textContent：否则切换语言时 applyLang
+        // 会按 currentStatusKey 把文案刷回「已就绪」，按钮却仍是禁用的。
         if (!resOk) {
-            statusText.textContent = '分辨率不一致：请仅导入同一摄像头视角的视频';
+            currentStatusKey = 'statusResolutionMismatch'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusResolutionMismatch'));
+        } else if (!capOk) {
+            // window.onload 时写入的「不支持」提示位于尚未显示的 viewer 内，随后又被
+            // 「正在解析/加载/已就绪」覆盖，用户最终只看到一个无解释的禁用按钮。
+            currentStatusKey = 'statusNoSupport'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusNoSupport'));
         }
     };
 

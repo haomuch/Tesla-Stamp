@@ -51,7 +51,8 @@ function drawRoundRect(ctx, x, y, w, h, r) {
 }
 
 function drawTeslaAP(ctx, x, centerY, size, apState, fontStack) {
-    const isActive = apState && apState !== "NONE" && apState !== "OFF" && apState !== "NULL" && apState !== "--";
+    // apState 由 app.js 经 protobuf 枚举映射而来，取值只可能是 NONE / TACC / AUTO / FULL
+    const isActive = !!apState && apState !== "NONE";
     const radius = size * 0.44;
     const pad = Math.ceil(size * 0.32); // shadowBlur = size*0.2，留出扩散余量
     const iconSize = Math.ceil(radius * 2 + pad * 2);
@@ -125,19 +126,7 @@ function drawTeslaAP(ctx, x, centerY, size, apState, fontStack) {
 
     // 5. AP Status Text（无阴影，直接绘制）
     const textX = x + radius * 2 + size * 0.25;
-    let displayLabel = "NONE";
-    if (isActive) {
-        const s = String(apState).toUpperCase();
-        if (s.includes("FULL") || s.includes("FSD") || s.includes("SELF") || s === "3") {
-            displayLabel = "FULL";
-        } else if (s.includes("AUTO") || s.includes("STEER") || s.includes("PILOT") || s.includes("LANE") || s === "2") {
-            displayLabel = "AUTO";
-        } else if (s.includes("TACC") || s.includes("ACC") || s.includes("CRUISE") || s === "1") {
-            displayLabel = "TACC";
-        } else {
-            displayLabel = apState;
-        }
-    }
+    const displayLabel = isActive ? apState : "NONE";
 
     ctx.save();
     ctx.font = `400 ${size}px ${fontStack}`;
@@ -387,7 +376,6 @@ function drawTeslaBlinkers(ctx, x, centerY, size, isLeftOn, isRightOn, blinkPhas
 
 window.TelemetryRenderer = {
     getVisualTextY,
-    drawRoundRect,
     drawTeslaAP,
     drawTeslaBrake,
     drawTeslaAccel,

@@ -53,8 +53,23 @@
 ## 📦 依赖项
 
 项目运行依赖以下库（已包含在 `public/` 目录下）：
+
 - [mp4-muxer](https://github.com/Vanilagy/mp4-muxer/) - 高性能 MP4 封装库。
 - [protobuf.js](https://github.com/protobufjs/protobuf.js) - Google Protobuf 解码/编码。
+
+---
+
+## 🌍 GPS 坐标系说明
+
+导入行车记录仪事件文件夹中的 `event.json` 后，其中的 `est_lat / est_lon` 会被写入导出视频的位置元数据（iOS 相册、macOS 等可直接显示拍摄地点）。
+
+- **默认（`gcj02`）**：按中国大陆车机的行为处理——`event.json` 中记录的是国测局 GCJ-02（火星坐标），工具会先反算为 WGS-84 再写入，避免相册二次加偏 100~200 米。
+- **`wgs84`**：港澳台、日韩、东南亚等地区的车机若记录的本身就是 WGS-84，请关闭转换，否则坐标会被反向偏移。在浏览器控制台执行一次即可（设置保存在本机）：
+
+```js
+localStorage.setItem('tesla_dashcam_gps_coord', 'wgs84');   // 关闭转换
+localStorage.removeItem('tesla_dashcam_gps_coord');         // 恢复默认
+```
 
 ---
 

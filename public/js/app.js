@@ -13,9 +13,7 @@
             (/Macintosh/i.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
     };
 
-    let fps = 36;
-    let targetBitrate = isIOSDevice() ? Math.round(6000000 * 2.0) : 6000000;
-    const MP4_EPOCH_OFFSET = 2082844800;
+    let targetBitrate = 6000000; // 实际值由 handleFiles 依据首段码率计算（含 iOS 加成）
     let originalMediaDate = null;
     let originalFileLastModified = null;
     let firstPlayLock = false;
@@ -55,8 +53,7 @@
     const cvs = document.querySelector("#videoCanvas");
     const gl = cvs.getContext('webgl2', { alpha: false, antialias: false, depth: false });
 
-    // Feature detection
-    const supportsWebCodecs = ("VideoEncoder" in window) && ("VideoDecoder" in window);
+    // Feature detection（WebCodecs 等能力统一由 checkCapabilities 检查）
     const hasWebGL = !!(gl);
 
     if (!hasWebGL) {
@@ -180,7 +177,6 @@
     let cachedCanvasWidth = -1;
     let cachedCanvasHeight = -1;
     let cachedFontSize = 0;
-    let cachedTextWidth = 0;
     let cachedLayout = null;
     let cachedSingleDigitWidth = 0;
     let textTextureInitialized = false;
@@ -191,7 +187,6 @@
     let vid = null;
     let dragging = false;
     let vidName = "tesla_dashcam";
-    let videoStartTime = 0;
     let isRecording = false;
     let startRequestPending = false; // 合成启动锁：initRecorder 含多次 await，防止重复进入
     let animationId = null;
@@ -200,9 +195,7 @@
     let compositeBarHeight = 0;
     let compositeSplitBelow = false;
 
-    let parsedFrames = [];
     let enumFields = null;
-    let currentParser = null;
     let eventLocation = null;
     const reusableDate = new Date();
 
@@ -246,7 +239,6 @@
             old.pause();
             if (currentVideoUrl) { URL.revokeObjectURL(currentVideoUrl); currentVideoUrl = null; }
             old.removeAttribute('src'); old.load();
-            if (old._readyPollTimer) { clearInterval(old._readyPollTimer); old._readyPollTimer = null; }
             old.remove();
         }
         const v = document.createElement("video");
@@ -273,28 +265,45 @@
         return rounded % 2 === 0 ? rounded : rounded + 1;
     };
 
-    const getInfoBarHeight = (width) => makeEvenDimension(Math.max(36, Math.ceil(width / 40 * 2)));
-    const getCompositeLayout = (videoWidth, videoHeight) => {
-        const splitBelow = (videoWidth / videoHeight) > 1.5;
-        const barHeight = getInfoBarHeight(videoWidth);
-        const compositeHeight = splitBelow ? videoHeight + barHeight : videoHeight;
-        return {
-            width: makeEvenDimension(videoWidth),
-            height: makeEvenDimension(compositeHeight),
-            splitBelow,
-            barHeight
-        };
+    const fontStack = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+    const BAR_MIN_HEIGHT = 36;
+    const GEAR_LETTERS = { PARK: "P", DRIVE: "D", REVERSE: "R", NEUTRAL: "N" };
+
+    /**
+     * 信息栏字号 / 高度的唯一算法。
+     * 布局阶段（getCompositeLayout 预留画布高度）与绘制阶段（drawFrame 生成文字纹理）
+     * 必须共用同一结果：此前二者各算一套（width/20 vs. 按字体实测放大后的 fontSize*2），
+     * 拆分模式下只要字体度量与假设不符，视频区就会被拉伸/压缩若干像素或多出黑边。
+     */
+    const computeBarMetrics = (canvasWidth) => {
+        let fontSize = canvasWidth / 40;
+        textCtx.font = `400 ${fontSize}px ${fontStack}`;
+        const testString = "0000-00-00 00:00:00";
+        const initialWidth = textCtx.measureText(testString).width;
+        const targetWidth = canvasWidth * 0.285;
+        if (initialWidth > 0 && initialWidth < targetWidth) {
+            fontSize *= (targetWidth / initialWidth);
+        }
+        const barHeight = makeEvenDimension(Math.max(BAR_MIN_HEIGHT, Math.ceil(fontSize * 2)));
+        return { fontSize, barHeight };
     };
 
     const EXPORT_MAX_WIDTH = 1920;
-    const getScaledCompositeLayout = (videoWidth, videoHeight, maxWidth) => {
-        const base = getCompositeLayout(videoWidth, videoHeight);
-        const scale = maxWidth > 0 && base.width > maxWidth ? maxWidth / base.width : 1;
+    /**
+     * 计算合成画布布局。maxWidth > 0 时按比例降采样（导出用）。
+     * 先确定最终画布宽度，再用该宽度求条高，保证与 drawFrame 中 computeBarMetrics(cvs.width) 完全一致。
+     */
+    const getCompositeLayout = (videoWidth, videoHeight, maxWidth = 0) => {
+        const splitBelow = (videoWidth / videoHeight) > 1.5;
+        const scale = maxWidth > 0 && videoWidth > maxWidth ? maxWidth / videoWidth : 1;
+        const width = makeEvenDimension(videoWidth * scale);
+        const frameHeight = makeEvenDimension(videoHeight * scale);
+        const barHeight = computeBarMetrics(width).barHeight;
         return {
-            width: makeEvenDimension(base.width * scale),
-            height: makeEvenDimension(base.height * scale),
-            splitBelow: base.splitBelow,
-            barHeight: makeEvenDimension(base.barHeight * scale)
+            width,
+            height: splitBelow ? frameHeight + barHeight : frameHeight,
+            splitBelow,
+            barHeight
         };
     };
 
@@ -348,15 +357,31 @@
         return [gcjLat - dLat, gcjLon - dLon];
     };
 
+    /**
+     * event.json 的坐标系设置。
+     * Tesla 中国大陆车机记录的是国测局 GCJ-02 火星坐标：iOS 相册会把它当作 WGS-84 再叠加一次
+     * 国内地图偏转，出现 100~200 米的二次加偏，因此默认反算为 WGS-84 后再写入 MP4。
+     * 但 gcj02ToWgs84 的"境内"判定只是一个粗略经纬度矩形，港澳台、日韩、东南亚等地区同样落在
+     * 矩形内；这些地区的车机若记录的本就是 WGS-84，转换反而会把坐标偏离 100~500 米。
+     * 故提供开关（默认沿用 GCJ-02 行为）：localStorage.setItem('tesla_dashcam_gps_coord', 'wgs84')
+     */
+    const GPS_COORD_STORAGE_KEY = 'tesla_dashcam_gps_coord';
+    const getGpsCoordSystem = () => {
+        try {
+            return localStorage.getItem(GPS_COORD_STORAGE_KEY) === 'wgs84' ? 'wgs84' : 'gcj02';
+        } catch (e) {
+            return 'gcj02';
+        }
+    };
+
     const formatISO6709 = (lat, lon) => {
         let latNum = typeof lat === 'number' ? lat : parseFloat(lat);
         let lonNum = typeof lon === 'number' ? lon : parseFloat(lon);
         if (isNaN(latNum) || isNaN(lonNum)) return null;
 
-        // Tesla 国内车机 event.json 记录的是国测局 GCJ-02 火星坐标。
-        // iOS 相册读取元数据时默认将其视作 WGS-84 并自动叠加国内高德地图的火星偏转（WGS84 -> GCJ02）。
-        // 因此在此逆向转换为 WGS-84，使 iOS 地图还原时精准落到真实位置，避免 100~200 米的二次加偏。
-        const [wgsLat, wgsLon] = gcj02ToWgs84(latNum, lonNum);
+        const [wgsLat, wgsLon] = getGpsCoordSystem() === 'gcj02'
+            ? gcj02ToWgs84(latNum, lonNum)
+            : [latNum, lonNum];
 
         const latSign = wgsLat >= 0 ? '+' : '-';
         const lonSign = wgsLon >= 0 ? '+' : '-';
@@ -625,11 +650,17 @@
         return new Blob(blobParts, { type: 'video/mp4' });
     };
 
-    let muxer = null, encoder = null, mediaRecorder = null, mediaRecorderStopPromise = null, frameCount = 0;
+    let muxer = null, encoder = null, frameCount = 0;
     let exportWidth = 0;
     let exportHeight = 0;
     let onEncoderError = null;
-    const checkCapabilities = () => !!(typeof Mp4Muxer !== 'undefined' && window.VideoEncoder && window.VideoFrame);
+    // 合成链路 = VideoDecoder 解码 → WebGL 叠加 → VideoEncoder 编码 → Mp4Muxer 封装，缺一不可。
+    // 此前未检查 WebGL 与 VideoDecoder：无 WebGL 时 drawFrame 直接返回，仍可点击合成并导出全黑视频。
+    const checkCapabilities = () => !!(
+        hasWebGL &&
+        typeof Mp4Muxer !== 'undefined' &&
+        window.VideoDecoder && window.VideoEncoder && window.VideoFrame
+    );
 
     applyLang(true);
 
@@ -664,73 +695,18 @@
         return candidates[candidates.length - 1];
     };
 
-    const initRecorder = async (isHEVC = false, srcWidth = null, srcHeight = null, framerate = null) => {
-        // 导出帧率必须与 PTS 计算所用的帧率一致（见 startRecording 的 activeFps）。
-        // 不能直接用全局 fps：它由 setupPreview 设为「当前预览片段」的帧率，
-        // 多段合并且各段 fps 不同时会导致输出时长/播放速度错误。
-        const exportFps = (typeof framerate === 'number' && framerate > 0) ? framerate : fps;
-
-        if (!supportsWebCodecs) {
-            const layout = getScaledCompositeLayout(
-                srcWidth != null ? srcWidth : (vid ? vid.videoWidth : 0),
-                srcHeight != null ? srcHeight : (vid ? vid.videoHeight : 0),
-                EXPORT_MAX_WIDTH
-            );
-            exportWidth = layout.width;
-            exportHeight = layout.height;
-            compositeSplitBelow = layout.splitBelow;
-            if (cvs.width !== exportWidth || cvs.height !== exportHeight) {
-                cvs.width = exportWidth;
-                cvs.height = exportHeight;
-            }
-            cachedCanvasWidth = -1;
-            cachedCanvasHeight = -1;
-            textTextureInitialized = false;
-
-            const stream = cvs.captureStream(exportFps);
-            const mimeCandidates = [
-                'video/mp4;codecs="avc1.640028"',
-                'video/mp4;codecs="avc1.42E01E"',
-                'video/webm;codecs=vp9',
-                'video/webm;codecs=vp8',
-                'video/webm'
-            ];
-            const mime = mimeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || 'video/webm';
-            console.log('MediaRecorder fallback mime:', mime);
-            mediaRecorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: targetBitrate });
-            const chunks = [];
-            mediaRecorderStopPromise = null;
-            mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
-            mediaRecorder.onstop = () => {
-                const blob = new Blob(chunks, { type: mime });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                const ext = mime.includes('webm') ? 'webm' : 'mp4';
-                a.download = `${vidName}_stamp.${ext}`;
-                a.click();
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
-                if (mediaRecorderStopPromise) {
-                    mediaRecorderStopPromise.resolve();
-                    mediaRecorderStopPromise = null;
-                }
-            };
-            mediaRecorder.onerror = (event) => {
-                console.warn('MediaRecorder error:', event);
-                if (mediaRecorderStopPromise) {
-                    mediaRecorderStopPromise.reject(new Error('MediaRecorder error'));
-                    mediaRecorderStopPromise = null;
-                }
-            };
-            mediaRecorder.start();
-            return true;
-        }
-
-        if (!window.VideoEncoder) return false;
-
-        const inWidth = srcWidth != null ? srcWidth : (vid ? vid.videoWidth : 0);
-        const inHeight = srcHeight != null ? srcHeight : (vid ? vid.videoHeight : 0);
-        const layout = getScaledCompositeLayout(inWidth, inHeight, EXPORT_MAX_WIDTH);
+    /**
+     * 创建 VideoEncoder + Mp4Muxer，并把画布切换到导出分辨率。
+     * @param {boolean} isHEVC   源为 HEVC 时优先尝试 HEVC 编码，不支持则回落 AVC
+     * @param {number}  inWidth  源视频宽（首段）
+     * @param {number}  inHeight 源视频高（首段）
+     * @param {number}  exportFps 导出帧率，必须与 startRecording 计算 PTS 所用的 activeFps 一致
+     *
+     * 曾有一条 MediaRecorder(captureStream) 回退路径，但按钮启用条件（checkCapabilities）
+     * 与帧驱动循环（VideoDecoder）都要求 WebCodecs，该路径实际不可达，已移除。
+     */
+    const initRecorder = async (isHEVC, inWidth, inHeight, exportFps) => {
+        const layout = getCompositeLayout(inWidth, inHeight, EXPORT_MAX_WIDTH);
         exportWidth = layout.width;
         exportHeight = layout.height;
         compositeSplitBelow = layout.splitBelow;
@@ -785,7 +761,6 @@
             codec: encoderCodec, width: exportWidth, height: exportHeight,
             bitrate: targetBitrate, framerate: exportFps
         });
-        return true;
     };
 
     const maybeEncode = (frame, options = {}) => {
@@ -801,7 +776,7 @@
         if (startRequestPending || isRecording) return;
         startRequestPending = true;
         try {
-            if (!clips || clips.length === 0 || !window.VideoDecoder) return;
+            if (clips.length === 0 || !checkCapabilities()) return;
             const isMerge = clips.length > 1;
             const refClip = clips[0];
             if (!isMerge && vid && vid.currentTime >= vid.duration) vid.currentTime = 0;
@@ -810,10 +785,11 @@
             // 首段帧率即本次合成的基准帧率，编码器配置与 PTS 计算共用同一个值
             const activeFps = (refClip.fps > 10 && refClip.fps < 100) ? refClip.fps : 36;
             startRecBtn.disabled = true;
-            if (!(await initRecorder(isHEVC, refClip.config.width, refClip.config.height, activeFps))) {
-                updateStartButtonState();
-                return;
-            }
+            // 「正在准备」对应的是 initRecorder 里的编码器能力探测（多次 await），必须在其之前显示；
+            // 此前它被放在 initRecorder 之后并被下一行的「正在合成」同步覆盖，从未真正绘制过。
+            currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
+            updateStatus(t('statusPreparing'), true);
+            await initRecorder(isHEVC, refClip.config.width, refClip.config.height, activeFps);
 
             if (vid) vid.pause();
 
@@ -859,9 +835,6 @@
             };
             const waitForFrameProcessed = () => new Promise(r => { frameProcessedResolve = r; });
 
-            currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
-            updateStatus(t('statusPreparing'), true);
-
             const frameDurationUs = Math.round(1000000 / activeFps);
             const keyframeInterval = Math.max(1, Math.round(activeFps / 2));
 
@@ -898,7 +871,9 @@
                         output: (frame) => {
                             pendingFramesCount++;
                             try {
-                                if (!isRecording) { frame.close(); pendingFramesCount--; frameProcessedSignal(); return; }
+                                // 已停止：直接丢帧。close / 计数 / 信号统一交给 finally，
+                                // 此前这里手动做了一遍、finally 又做一遍，导致 pendingFramesCount 被双重递减变负。
+                                if (!isRecording) return;
                                 const timeSec = frame.timestamp / 1000000;
                                 if (timeSec >= skipBefore) {
                                     drawFrame(timeSec, frame);
@@ -951,14 +926,10 @@
                         hardwareAcceleration: 'no-preference'
                     });
 
+                    // 解码起点：默认从头（首段首帧非关键帧时，由下方 hasSeenKeyFrame 跳过前导 delta 帧）；
+                    // 首段指定了录制起点时，回退到起点之前最近的关键帧
                     let hasSeenKeyFrame = false;
                     let startIdx = 0;
-                    if (clipOrdinal === 0) {
-                        // 首段始终从首个关键帧开始解码，避免首帧非关键帧导致的黑屏/绿屏
-                        for (let i = 0; i < samples.length; i++) {
-                            if (samples[i].type === 'key') { startIdx = i; break; }
-                        }
-                    }
                     if (clipOrdinal === 0 && recordingStartTime > 0) {
                         const startTimeUs = recordingStartTime * 1000000;
                         let lastKeyIdx = 0;
@@ -974,6 +945,7 @@
                         const s = samples[i];
                         const isKeyFrame = s.type === 'key';
 
+                        // 关键帧之前的 delta 帧无法解码（黑屏/绿屏），一律跳过
                         if (!hasSeenKeyFrame && !isKeyFrame) {
                             continue;
                         }
@@ -984,6 +956,13 @@
                         }
 
                         const sampleData = await s.loadData();
+                        // 文件被截断时 readSampleData 返回 null（样本越过 EOF）。样本按文件偏移递增，
+                        // 首个越界样本之后的全部样本必然也越界，故直接结束本段，保留已解码内容；
+                        // 此前会把 null 塞给 EncodedVideoChunk 抛出 TypeError，整次合成失败。
+                        if (!sampleData) {
+                            console.warn(`样本 #${i} 超出文件范围，本段提前结束`);
+                            break;
+                        }
                         decoder.decode(new EncodedVideoChunk({
                             type: s.type,
                             timestamp: s.timestamp,
@@ -1038,7 +1017,7 @@
                 cachedCanvasHeight = -1;
                 textTextureInitialized = false;
             }
-            startRecBtn.disabled = false;
+            updateStartButtonState();
             stopRecBtn.disabled = true;
             playPauseBtn.disabled = false;
             timeSlider.disabled = false;
@@ -1047,61 +1026,68 @@
         }
     };
 
+    // 停止/导出去重锁：encoder.flush() 最长可等 30s，此前「保存视频」按钮直到函数末尾才禁用，
+    // 期间重复点击（或合成自然结束时的自动调用与手动点击重叠）会二次进入，重复刷状态、重复起定时器。
+    let stopInProgress = false;
     const stopRecording = async () => {
+        if (stopInProgress) return;
+        stopInProgress = true;
+        stopRecBtn.disabled = true;
         isRecording = false;
         currentStatusKey = 'statusExporting'; currentStatusArg = null; currentStatusIsRec = false;
         updateStatus(t('statusExporting'));
-        if (encoder && encoder.state !== 'closed') {
-            try {
-                await Promise.race([
-                    encoder.flush(),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('Encoder flush timeout')), 30000))
-                ]);
-            } catch (e) {
-                console.warn('Encoder flush 超时或出错，强制关闭:', e.message);
-            }
-            if (encoder.state !== 'closed') encoder.close();
-        }
-        if (mediaRecorder) {
-            await new Promise((resolve, reject) => {
-                if (mediaRecorder.state === 'recording') {
-                    mediaRecorderStopPromise = { resolve, reject };
-                    mediaRecorder.stop();
-                } else {
-                    resolve();
+        try {
+            if (encoder && encoder.state !== 'closed') {
+                try {
+                    await Promise.race([
+                        encoder.flush(),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('Encoder flush timeout')), 30000))
+                    ]);
+                } catch (e) {
+                    console.warn('Encoder flush 超时或出错，强制关闭:', e.message);
                 }
-            }).catch((e) => {
-                console.warn('MediaRecorder stop failed:', e);
-            });
-            mediaRecorder = null;
-        }
-        if (muxer) {
-            muxer.finalize();
-            const { buffer } = muxer.target;
-            // 立即切断 muxer 对完整输出 MP4（可达数百 MB）的引用，否则模块级变量会
-            // 把它一直钉在堆上直到下次合成，连续导出极易 OOM。
-            // 数据本身由 finalBlob → blob URL 独立持有，释放是安全的。
+                if (encoder.state !== 'closed') encoder.close();
+            }
+            if (muxer) {
+                muxer.finalize();
+                const { buffer } = muxer.target;
+                // 立即切断 muxer 对完整输出 MP4（可达数百 MB）的引用，否则模块级变量会
+                // 把它一直钉在堆上直到下次合成，连续导出极易 OOM。
+                // 数据本身由 finalBlob → blob URL 独立持有，释放是安全的。
+                muxer = null;
+                const finalBlob = patchMp4Metadata(buffer, originalMediaDate, eventLocation);
+                const file = new File([finalBlob], `${vidName}_stamp.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
+                const url = URL.createObjectURL(file);
+                const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
+                setTimeout(() => { URL.revokeObjectURL(url); currentStatusKey = 'statusDone'; currentStatusArg = null; currentStatusIsRec = false; updateStatus(t('statusDone')); }, 1000);
+            }
+        } catch (e) {
+            // finalize / 元数据修补失败：必须在此处收尾，否则手动点击「保存视频」触发的失败
+            // 不会经过 startRecording 的 catch，状态会永远停在「正在导出...」
+            console.error("Export error:", e);
             muxer = null;
-            const finalBlob = patchMp4Metadata(buffer, originalMediaDate, eventLocation);
-            const file = new File([finalBlob], `${vidName}_stamp.mp4`, { type: 'video/mp4', lastModified: originalFileLastModified || Date.now() });
-            const url = URL.createObjectURL(file);
-            const a = document.createElement('a'); a.href = url; a.download = file.name; a.click();
-            setTimeout(() => { URL.revokeObjectURL(url); currentStatusKey = 'statusDone'; currentStatusArg = null; currentStatusIsRec = false; updateStatus(t('statusDone')); }, 1000);
+            currentStatusKey = 'statusError'; currentStatusArg = e.message; currentStatusIsRec = false;
+            updateStatus(t('statusError', e.message));
+        } finally {
+            if (encoder) {
+                try { if (encoder.state !== 'closed') encoder.close(); } catch (_) { }
+                encoder = null;
+            }
+            if (vid) {
+                const layout = getCompositeLayout(vid.videoWidth, vid.videoHeight);
+                cvs.width = layout.width;
+                cvs.height = layout.height;
+                compositeSplitBelow = layout.splitBelow;
+                cachedCanvasWidth = -1;
+                cachedCanvasHeight = -1;
+                textTextureInitialized = false;
+            }
+            // 释放各片段解析器的顺序预读缓冲（每个最多 1MB）
+            for (const c of clips) { if (c.parser) c.parser.releaseReadBuffer(); }
+            stopInProgress = false;
+            updateStartButtonState(); stopRecBtn.disabled = true;
+            playPauseBtn.disabled = false; timeSlider.disabled = false;
         }
-        if (vid) {
-            const layout = getCompositeLayout(vid.videoWidth, vid.videoHeight);
-            cvs.width = layout.width;
-            cvs.height = layout.height;
-            compositeSplitBelow = layout.splitBelow;
-            cachedCanvasWidth = -1;
-            cachedCanvasHeight = -1;
-            textTextureInitialized = false;
-        }
-        encoder = null;
-        // 释放各片段解析器的顺序预读缓冲（每个最多 1MB）
-        for (const c of clips) { if (c.parser) c.parser.releaseReadBuffer(); }
-        startRecBtn.disabled = false; stopRecBtn.disabled = true;
-        playPauseBtn.disabled = false; timeSlider.disabled = false;
     };
 
     // --- WebGL Render Loop ---
@@ -1111,8 +1097,8 @@
         if (!source || (!sourceFrame && source.readyState < 2)) return;
 
         const currentTime = forcedTime ?? vid.currentTime;
-        const ctx = currentClipContext || { videoStartTime, parsedFrames, fps };
-        const fontStack = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+        // setupPreview 在创建 <video> 之前就已设置 currentClipContext，能走到这里它必然非空
+        const ctx = currentClipContext;
 
         // 1. Sync dimensions & Text Canvas sizing
         if (cvs.width !== cachedCanvasWidth || cvs.height !== cachedCanvasHeight) {
@@ -1120,28 +1106,15 @@
             cachedCanvasHeight = cvs.height;
             gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
 
-            let fontSize = cvs.width / 40;
-            textCtx.font = `400 ${fontSize}px ${fontStack}`;
-
-            const testString = "0000-00-00 00:00:00";
-            const initialWidth = textCtx.measureText(testString).width;
-            const targetWidthRatio = 0.285;
-            const targetWidth = cvs.width * targetWidthRatio;
-
-            if (initialWidth > 0 && initialWidth < targetWidth) {
-                fontSize *= (targetWidth / initialWidth);
-                textCtx.font = `400 ${fontSize}px ${fontStack}`;
-            }
+            // 与 getCompositeLayout 共用同一算法，保证绘制条高 == 布局预留条高
+            const { fontSize, barHeight } = computeBarMetrics(cvs.width);
             cachedFontSize = fontSize;
-
-            const bgH = Math.ceil(cachedFontSize * 2);
             textCanvas.width = cvs.width;
-            textCanvas.height = bgH;
-            compositeBarHeight = bgH;
+            textCanvas.height = barHeight;
+            compositeBarHeight = barHeight;
 
             textCtx.font = `400 ${fontSize}px ${fontStack}`;
             textCtx.textBaseline = 'middle';
-            cachedTextWidth = textCtx.measureText(testString).width;
             cachedSingleDigitWidth = textCtx.measureText("0").width;
 
             textCtx.font = `700 ${fontSize}px ${fontStack}`;
@@ -1189,23 +1162,9 @@
                 accelNum = Math.round(sei.acceleratorPedalPosition || 0);
                 speedVal = speed.toString();
 
-                const rawGear = sei.gearState;
-                if (enumFields && enumFields.gearState && enumFields.gearState.valuesById && rawGear in enumFields.gearState.valuesById) {
-                    const valName = enumFields.gearState.valuesById[rawGear];
-                    if (valName === "DRIVE") gearStr = "D";
-                    else if (valName === "REVERSE") gearStr = "R";
-                    else if (valName === "NEUTRAL") gearStr = "N";
-                    else if (valName === "PARK") gearStr = "P";
-                } else if (typeof rawGear === 'number') {
-                    if (rawGear === 1) gearStr = "D";
-                    else if (rawGear === 2) gearStr = "R";
-                    else if (rawGear === 3) gearStr = "N";
-                    else gearStr = "P";
-                } else if (typeof rawGear === 'string') {
-                    if (rawGear.includes("DRIVE")) gearStr = "D";
-                    else if (rawGear.includes("REVERSE")) gearStr = "R";
-                    else if (rawGear.includes("NEUTRAL")) gearStr = "N";
-                    else gearStr = "P";
+                // decodeSei 已把 gearState 归一为枚举数字，经 proto 枚举名映射为档位字母；未知值按 P 处理
+                if (enumFields && enumFields.gearState) {
+                    gearStr = GEAR_LETTERS[enumFields.gearState.valuesById[sei.gearState]] || "P";
                 }
 
                 isLeftBlinkerOn = !!sei.blinkerOnLeft;
@@ -1389,14 +1348,11 @@
             vid.pause();
             if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
         }
-        currentParser = clip.parser;
-        parsedFrames = clip.parsedFrames;
-        videoStartTime = clip.videoStartTime;
-        fps = clip.fps;
         firstKeyFrameTime = clip.firstKeyFrameTime;
         firstPlayLock = !autoPlay;
-        vidName = clip.name;
-        originalFileLastModified = clip.lastModified;
+        // 注意：vidName / originalFileLastModified 是「输出文件」的元信息，只由 handleFiles 依据首段设置一次；
+        // 此处不可按预览段覆盖，否则输出文件名与 lastModified 会随「最后预览的是哪一段」而变，
+        // 且 handleFiles 刚拼好的 _merged 后缀会被立刻抹掉。
         enumFields = clip.enumFields;
         currentClipContext = clip;
         previewClipIndex = clips.indexOf(clip);
@@ -1505,7 +1461,7 @@
         nextVid.onwaiting = handleStall;
         nextVid.onstalled = handleStall;
 
-        if (currentVideoUrl) { try { URL.revokeObjectURL(currentVideoUrl); } catch (e) { } }
+        // 旧的 blob URL 已在 createFreshVideo() 中撤销
         currentVideoUrl = URL.createObjectURL(clip.file);
         nextVid.src = currentVideoUrl;
         vid = nextVid;
@@ -1560,8 +1516,12 @@
             if (isVideo) videoFiles.push(f);
             else if (isJson && !jsonFile) jsonFile = f;
         }
+        // 文件已取出，立即清空 input：否则解析失败后重新选择同一文件不会触发 change 事件
+        fileInput.value = "";
 
-        // event.json 坐标（合并后写入首段元数据）
+        // event.json 坐标（合并后写入首段元数据）。先记住旧值：新一批视频若全部解析失败，
+        // 保留的仍是旧片段，坐标也应随之回退，避免把失败批次的坐标写进旧视频。
+        const prevLocation = eventLocation;
         if (jsonFile) {
             try {
                 const text = await jsonFile.text();
@@ -1570,7 +1530,7 @@
                 const lon = data.est_lon !== undefined ? data.est_lon : data.longitude;
                 if (lat !== undefined && lon !== undefined && !isNaN(parseFloat(lat)) && !isNaN(parseFloat(lon))) {
                     eventLocation = { lat: parseFloat(lat), lon: parseFloat(lon) };
-                    console.log("已成功读取 event.json 坐标:", eventLocation);
+                    console.log("已成功读取 event.json 坐标:", eventLocation, "坐标系:", getGpsCoordSystem());
                 } else {
                     eventLocation = null;
                 }
@@ -1585,9 +1545,10 @@
         if (videoFiles.length === 0) return;
 
         syncPlayButton(true);
-        fps = 36;
         cachedCanvasWidth = -1; cachedCanvasHeight = -1;
         textTextureInitialized = false;
+        // 图标缓存按渲染尺寸建键，换视频（分辨率可能变化）时清空，避免旧尺寸条目滞留
+        TelemetryRenderer.clearIconCache();
         videoViewer.style.display = "block"; dropZone.style.display = "none";
         currentStatusKey = 'statusParsing'; currentStatusArg = null; currentStatusIsRec = false;
         updateStatus(t('statusParsing'));
@@ -1595,43 +1556,52 @@
         const parsed = [];
         for (const f of videoFiles) {
             try {
-                const c = await MergeManager.prepareClip(f);
-                if (c) parsed.push(c);
+                parsed.push(await MergeManager.prepareClip(f));
             } catch (e) {
                 console.error("解析视频失败:", f.name, e);
             }
         }
         if (parsed.length === 0) {
-            currentStatusKey = 'statusError'; currentStatusArg = '解析失败'; currentStatusIsRec = false;
-            updateStatus(t('statusError', '没有可解析的视频'));
+            // 拖放区此时已隐藏，因此错误态必须能显示「更换视频」（见 i18n.js reselectKeys），
+            // 否则用户只能刷新页面。旧片段（若有）原样保留，可继续预览/合成。
+            eventLocation = prevLocation;
+            currentStatusKey = 'statusParseError'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusParseError'));
             return;
         }
 
         clips = MergeManager.sortClips(parsed);
-        for (const c of clips) c.targetBitrate = computeTargetBitrate(c);
         mergeAnalysis = MergeManager.analyzeClips(clips);
         computeMergedTimeline();
 
-        originalMediaDate = Math.floor(clips[0].videoStartTime / 1000) + MP4_EPOCH_OFFSET;
+        // 输出文件的元信息一律取自首段（时间基准 / 文件名 / lastModified / 码率），与预览到哪一段无关
+        originalMediaDate = Math.floor(clips[0].videoStartTime / 1000) + DashcamHelpers.MP4_EPOCH_OFFSET;
         vidName = clips[0].name + (clips.length > 1 ? '_merged' : '');
-        targetBitrate = clips[0].targetBitrate;
+        originalFileLastModified = clips[0].lastModified;
+        targetBitrate = computeTargetBitrate(clips[0]);
         currentClipContext = clips[0];
 
         await setupPreview(clips[0]);
-        fileInput.value = "";
         updateStartButtonState();
     };
 
     const updateStartButtonState = () => {
-        if (!clips || clips.length === 0) { startRecBtn.disabled = true; return; }
+        if (clips.length === 0) { startRecBtn.disabled = true; return; }
         const capOk = checkCapabilities();
         const resOk = mergeAnalysis ? mergeAnalysis.resolutionOk : true;
         startRecBtn.disabled = !(capOk && resOk);
         // 只要能合成（段数不限），状态就保持为「已就绪」，不追加段数/时间连续性等附加信息。
-        // 仅在无法合成时（分辨率不一致）才覆盖为错误提示——此时「开始合成」是禁用的，
-        // 显示「已就绪」会自相矛盾。
+        // 仅在无法合成时才覆盖为对应提示——此时「开始合成」是禁用的，显示「已就绪」会自相矛盾。
+        // 必须走 currentStatusKey 状态机而不是直接写 textContent：否则切换语言时 applyLang
+        // 会按 currentStatusKey 把文案刷回「已就绪」，按钮却仍是禁用的。
         if (!resOk) {
-            statusText.textContent = '分辨率不一致：请仅导入同一摄像头视角的视频';
+            currentStatusKey = 'statusResolutionMismatch'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusResolutionMismatch'));
+        } else if (!capOk) {
+            // window.onload 时写入的「不支持」提示位于尚未显示的 viewer 内，随后又被
+            // 「正在解析/加载/已就绪」覆盖，用户最终只看到一个无解释的禁用按钮。
+            currentStatusKey = 'statusNoSupport'; currentStatusArg = null; currentStatusIsRec = false;
+            updateStatus(t('statusNoSupport'));
         }
     };
 
@@ -1732,10 +1702,10 @@
     };
 
     if (timeSlider) {
-        // 统一的全局时间定位：live=true 表示拖动过程中（oninput），false 表示松手（onchange）
+        // 拖动过程中（oninput）的全局时间定位。
         // 跨片段拖动时「立即」切换视频源并在目标位置定位，使预览在拖动过程中实时跟随进度条，
         // 而不是停在旧片段的末帧/首帧直到松手。
-        const applyGlobalScrub = (live) => {
+        const applyGlobalScrub = () => {
             const gt = sliderToGlobalTime(timeSlider.value);
             timeDisplay.textContent = `${formatTime(gt)} / ${formatTime(mergedTotalDuration)}`;
             const { i, localTime } = findClipForGlobalTime(gt);
@@ -1748,7 +1718,7 @@
                 // 本段内：实时拖动预览
                 pendingClipSwitch = null;
                 scrubTarget = clamped;
-                if (live && !scrubRaf) {
+                if (!scrubRaf) {
                     lastScrubTime = 0;
                     scrubRaf = requestAnimationFrame(scrubLoop);
                 }
@@ -1766,7 +1736,7 @@
 
         timeSlider.oninput = () => {
             dragging = true;
-            applyGlobalScrub(true);
+            applyGlobalScrub();
         };
 
         timeSlider.onchange = () => {

@@ -1,6 +1,6 @@
 /**
  * Tesla Dashcam Stamp - Merge Manager
- * 纯逻辑模块：多视频片段的解析、排序、时间戳连续性校验、分辨率一致性校验。
+ * 纯逻辑模块：多视频片段的解析、排序、分辨率一致性校验。
  * 不触碰任何 UI / WebGL / WebCodecs，便于在 app.js 中复用。
  *
  * 依赖全局：DashcamMP4、DashcamHelpers（已在 index.html 中先于本文件加载）。
@@ -9,36 +9,13 @@
 (function () {
     'use strict';
 
-    let _protobuf = null;
-
-    const getProtobuf = async () => {
-        if (!_protobuf) {
-            _protobuf = await DashcamHelpers.initProtobuf();
-        }
-        return _protobuf;
-    };
-
-    const getCameraFromName = (name) => {
-        const m = name.match(/_(front|back|left_repeater|right_repeater|left|right)(?:[_\-.]|$)/i)
-            || name.match(/(front|back|left|right)/i);
-        if (!m) return '';
-        const c = m[1].toLowerCase();
-        if (c.indexOf('front') >= 0) return 'FRONT';
-        if (c.indexOf('back') >= 0) return 'BACK';
-        if (c.indexOf('left') >= 0) return 'LEFT';
-        if (c.indexOf('right') >= 0) return 'RIGHT';
-        return c.toUpperCase();
-    };
-
     /**
      * 解析单个视频文件，返回 Clip 上下文对象（不含 UI 状态）。
-     * 解析失败返回 null。
+     * 调用方（handleFiles）已按类型/扩展名筛选过视频文件；解析失败时抛出异常。
      */
     const prepareClip = async (file) => {
-        const isVideo = file.type.startsWith('video/') || /\.(mp4|mov|m4v)$/i.test(file.name);
-        if (!isVideo) return null;
-
-        const protobuf = await getProtobuf();
+        // initProtobuf 内部已缓存，重复调用只返回同一对象
+        const protobuf = await DashcamHelpers.initProtobuf();
         const enumFields = protobuf.enumFields;
         // 文件模式：不把整个视频读进内存，只加载 moov，样本数据在解析/合成时按需读取。
         // 整包 arrayBuffer() 在多段导入时会直接撑爆移动端内存上限。
@@ -103,7 +80,7 @@
             }
         }
 
-        const creationTime = mp4CreationTime || videoStartTime;
+        console.log(`[${file.name}] 时间基准来源: ${timeBaseSource}`);
 
         return {
             file,
@@ -113,19 +90,14 @@
             parsedFrames,
             enumFields,
             name: file.name.substring(0, file.name.lastIndexOf('.')),
-            fullName: file.name,
             lastModified: file.lastModified,
             width: config.width,
             height: config.height,
-            codec: config.codec,
             fps,
             durationMs,
             firstKeyFrameTime,
             videoStartTime,
-            creationTime,
-            timeBaseSource,
-            originalBitrate,
-            camera: getCameraFromName(file.name)
+            originalBitrate
         };
     };
 
@@ -137,40 +109,18 @@
     };
 
     /**
-     * 校验分辨率一致性 + 计算相邻片段时间连续性。
-     * @returns {{ resolutionOk:boolean, mismatch:Set<string>, continuity:Array<{gapMs:number,status:string}> }}
-     *   status: 'start' | 'continuous' | 'gap' | 'overlap'
+     * 校验各片段分辨率是否一致（合成时所有片段共用同一编码器配置，分辨率必须相同）。
+     * @returns {{ resolutionOk: boolean }}
      */
-    const analyzeClips = (clips, toleranceMs = 1000) => {
-        const mismatch = new Set();
-        if (clips.length > 0) {
-            const ref = clips[0];
-            for (const c of clips) {
-                if (c.width !== ref.width || c.height !== ref.height) {
-                    mismatch.add(c.fullName);
-                }
-            }
-        }
-        const continuity = [];
-        for (let i = 0; i < clips.length; i++) {
-            if (i === 0) {
-                continuity.push({ gapMs: 0, status: 'start' });
-                continue;
-            }
-            const prevEnd = clips[i - 1].videoStartTime + clips[i - 1].durationMs;
-            const gapMs = clips[i].videoStartTime - prevEnd;
-            let status = 'continuous';
-            if (gapMs > toleranceMs) status = 'gap';
-            else if (gapMs < -toleranceMs) status = 'overlap';
-            continuity.push({ gapMs, status });
-        }
-        return { resolutionOk: mismatch.size === 0, mismatch, continuity };
+    const analyzeClips = (clips) => {
+        const ref = clips[0];
+        const resolutionOk = !ref || clips.every(c => c.width === ref.width && c.height === ref.height);
+        return { resolutionOk };
     };
 
     window.MergeManager = {
         prepareClip,
         sortClips,
-        analyzeClips,
-        getProtobuf
+        analyzeClips
     };
 })();

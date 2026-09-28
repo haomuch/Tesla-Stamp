@@ -27,28 +27,16 @@ const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Da
 
 class DashcamMP4 {
     /**
-     * @param {Uint8Array|File|Blob|ArrayBuffer} source - Source video buffer or file handle.
+     * 文件模式解析器：不把整个视频读进内存，只加载 moov，样本数据按需从文件读取。
+     * @param {File|Blob} file - 视频文件句柄。
      */
-    constructor(source) {
-        if (source instanceof Uint8Array) {
-            this.buffer = source;
-        } else if (source instanceof ArrayBuffer) {
-            this.buffer = new Uint8Array(source);
-        } else {
-            this.buffer = null;
-            this.sourceFile = source;
-        }
+    constructor(file) {
+        this.sourceFile = file;
 
-        // this.view 始终指向「box 解析视图」：
-        //   全量模式 = 整个文件；文件模式 = 仅 moov（由 init() 懒加载）
-        // this._boxData 是 view 对应的 Uint8Array，用于切片拷贝。
-        if (this.buffer) {
-            this.view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
-            this._boxData = this.buffer;
-        } else {
-            this.view = null;
-            this._boxData = null;
-        }
+        // this.view / this._boxData 指向 moov 的内容（由 init() 懒加载），
+        // 因此所有 box 偏移都是相对 moov 起点，而不是相对文件起点。
+        this.view = null;
+        this._boxData = null;
 
         this._config = null;
         this._samples = null;
@@ -61,16 +49,9 @@ class DashcamMP4 {
         this._readEnd = 0;
     }
 
-    attachSource(source) {
-        if (source instanceof File || source instanceof Blob) {
-            this.sourceFile = source;
-        }
-    }
-
     /**
-     * 文件模式初始化：只把 moov 读进内存（通常几十 KB ~ 数 MB），
+     * 初始化：只把 moov 读进内存（通常几十 KB ~ 数 MB），
      * 样本数据留在磁盘上按需读取，避免整个视频常驻内存导致移动端 OOM。
-     * 全量模式（构造时传入 ArrayBuffer/Uint8Array）无需调用。
      */
     async init() {
         if (this.view) return;
@@ -135,14 +116,6 @@ class DashcamMP4 {
     }
 
     async readSampleData(offset, size) {
-        if (this.buffer) {
-            return this.buffer.subarray(offset, offset + size);
-        }
-
-        if (!this.sourceFile) {
-            return null;
-        }
-
         // 顺序预读缓冲：解析与合成都是严格递增访问，命中率接近 100%。
         // 原先的 LRU 缓存在顺序场景下命中率为 0，却会常驻若干最大样本，纯属浪费。
         if (this._readBuf && offset >= this._readStart && offset + size <= this._readEnd) {
@@ -205,19 +178,12 @@ class DashcamMP4 {
         throw new Error(`Box "${name}" not found`);
     }
 
-    findMdat() {
-        const mdat = this.findBox(0, this.view.byteLength, 'mdat');
-        return { offset: mdat.start, size: mdat.size };
-    }
-
     getConfig() {
         if (this._config) return this._config;
         if (!this.view) throw new Error("解析器尚未初始化，请先调用 init()");
 
-        // 文件模式下 this.view 就是 moov 本身；全量模式需要从文件顶层定位 moov
-        const moov = this.buffer
-            ? this.findBox(0, this.view.byteLength, 'moov')
-            : { start: 0, end: this.view.byteLength, size: this.view.byteLength };
+        // this.view 就是 moov 本身
+        const moov = { start: 0, end: this.view.byteLength };
         let trakPos = moov.start;
 
         while (trakPos < moov.end) {
@@ -401,10 +367,7 @@ class DashcamMP4 {
     getCreationTime() {
         try {
             if (!this.view) return null;
-            const moov = this.buffer
-                ? this.findBox(0, this.view.byteLength, 'moov')
-                : { start: 0, end: this.view.byteLength };
-            const mvhd = this.findBox(moov.start, moov.end, 'mvhd');
+            const mvhd = this.findBox(0, this.view.byteLength, 'mvhd');
             const version = this.view.getUint8(mvhd.start);
             const secondsSince1904 = version === 1
                 ? Number(this.view.getBigUint64(mvhd.start + 4))
@@ -425,9 +388,7 @@ class DashcamMP4 {
         const samples = this.getSamples();
         for (let idx = 0; idx < samples.length; idx++) {
             const s = samples[idx];
-            const sampleBuf = this.buffer
-                ? this.buffer.subarray(s.offset, s.offset + s.size)
-                : await this.readSampleData(s.offset, s.size);
+            const sampleBuf = await this.readSampleData(s.offset, s.size);
             if (!sampleBuf || sampleBuf.byteLength < 4) continue;
 
             const dv = new DataView(sampleBuf.buffer, sampleBuf.byteOffset, sampleBuf.byteLength);
@@ -475,8 +436,7 @@ class DashcamMP4 {
 
             // 只保留绘制真正需要的字段。protobuf 的 Message 实例带有原型链和全部 16 个字段，
             // 每个视频帧都保留一份会显著放大内存（数万帧 × 完整对象）。
-            // 同时把命名统一为驼峰，省去下游的兼容分支。
-            const rawGear = d.gearState !== undefined ? d.gearState : d.gear_state;
+            // protobuf.parse 默认 keepCase=false，字段名已是驼峰；枚举字段解码为数字。
             return {
                 // frameSeqNo 不是绘制字段，但 MergeManager 用它推导视频起始时间基准，必须保留
                 frameSeqNo: d.frameSeqNo,
@@ -484,9 +444,9 @@ class DashcamMP4 {
                 autopilotState: d.autopilotState || 0,
                 brakeApplied: !!d.brakeApplied,
                 acceleratorPedalPosition: d.acceleratorPedalPosition || 0,
-                gearState: rawGear !== undefined ? rawGear : 0,
-                blinkerOnLeft: !!(d.blinkerOnLeft || d.blinker_on_left),
-                blinkerOnRight: !!(d.blinkerOnRight || d.blinker_on_right)
+                gearState: d.gearState || 0,
+                blinkerOnLeft: !!d.blinkerOnLeft,
+                blinkerOnRight: !!d.blinkerOnRight
             };
         } catch {
             return null;
@@ -559,5 +519,5 @@ window.DashcamMP4 = DashcamMP4;
         return { SeiMetadata, enumFields: cachedEnumFields };
     }
 
-    window.DashcamHelpers = { initProtobuf };
+    window.DashcamHelpers = { initProtobuf, MP4_EPOCH_OFFSET };
 })();

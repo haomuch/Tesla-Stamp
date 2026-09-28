@@ -20,6 +20,8 @@ const i18n = {
         statusExporting: '正在导出...',
         statusDone: '处理完成',
         statusError: (msg) => `合成出错: ${msg}`,
+        statusParseError: '未找到可解析的视频文件，请重新选择',
+        statusResolutionMismatch: '分辨率不一致：请仅导入同一摄像头视角的视频',
         statusNoSupport: '当前浏览器不支持合成功能',
         reselectBtn: '更换视频',
         startRecBtn: '开始合成',
@@ -44,6 +46,8 @@ const i18n = {
         statusExporting: 'Exporting...',
         statusDone: 'Done',
         statusError: (msg) => `Recording error: ${msg}`,
+        statusParseError: 'No readable video file found. Please select again.',
+        statusResolutionMismatch: 'Resolution mismatch: import clips from the same camera only.',
         statusNoSupport: 'This browser does not support recording',
         reselectBtn: 'Change Video',
         startRecBtn: 'Start Recording',
@@ -74,7 +78,11 @@ const updateStatus = (text, isRec = false) => {
     if (statusBadge) {
         isRec ? statusBadge.classList.add("recording") : statusBadge.classList.remove("recording");
     }
-    const reselectKeys = ['statusReady', 'statusDone', 'statusNoSupport'];
+    // 所有「终态」都必须能更换视频：错误态若不放行，用户会因拖放区已隐藏而只能刷新页面
+    const reselectKeys = [
+        'statusReady', 'statusDone', 'statusNoSupport',
+        'statusError', 'statusParseError', 'statusResolutionMismatch'
+    ];
     const showReselect = reselectKeys.includes(currentStatusKey);
     if (reselectBtn) {
         reselectBtn.style.display = showReselect ? "inline-flex" : "none";

@@ -13,9 +13,7 @@
             (/Macintosh/i.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
     };
 
-    let fps = 36;
-    let targetBitrate = isIOSDevice() ? Math.round(6000000 * 2.0) : 6000000;
-    const MP4_EPOCH_OFFSET = 2082844800;
+    let targetBitrate = 6000000; // 实际值由 handleFiles 依据首段码率计算（含 iOS 加成）
     let originalMediaDate = null;
     let originalFileLastModified = null;
     let firstPlayLock = false;
@@ -55,8 +53,7 @@
     const cvs = document.querySelector("#videoCanvas");
     const gl = cvs.getContext('webgl2', { alpha: false, antialias: false, depth: false });
 
-    // Feature detection
-    const supportsWebCodecs = ("VideoEncoder" in window) && ("VideoDecoder" in window);
+    // Feature detection（WebCodecs 等能力统一由 checkCapabilities 检查）
     const hasWebGL = !!(gl);
 
     if (!hasWebGL) {
@@ -190,7 +187,6 @@
     let vid = null;
     let dragging = false;
     let vidName = "tesla_dashcam";
-    let videoStartTime = 0;
     let isRecording = false;
     let startRequestPending = false; // 合成启动锁：initRecorder 含多次 await，防止重复进入
     let animationId = null;
@@ -199,9 +195,7 @@
     let compositeBarHeight = 0;
     let compositeSplitBelow = false;
 
-    let parsedFrames = [];
     let enumFields = null;
-    let currentParser = null;
     let eventLocation = null;
     const reusableDate = new Date();
 
@@ -245,7 +239,6 @@
             old.pause();
             if (currentVideoUrl) { URL.revokeObjectURL(currentVideoUrl); currentVideoUrl = null; }
             old.removeAttribute('src'); old.load();
-            if (old._readyPollTimer) { clearInterval(old._readyPollTimer); old._readyPollTimer = null; }
             old.remove();
         }
         const v = document.createElement("video");
@@ -274,6 +267,7 @@
 
     const fontStack = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
     const BAR_MIN_HEIGHT = 36;
+    const GEAR_LETTERS = { PARK: "P", DRIVE: "D", REVERSE: "R", NEUTRAL: "N" };
 
     /**
      * 信息栏字号 / 高度的唯一算法。
@@ -656,7 +650,7 @@
         return new Blob(blobParts, { type: 'video/mp4' });
     };
 
-    let muxer = null, encoder = null, mediaRecorder = null, mediaRecorderStopPromise = null, frameCount = 0;
+    let muxer = null, encoder = null, frameCount = 0;
     let exportWidth = 0;
     let exportHeight = 0;
     let onEncoderError = null;
@@ -701,72 +695,17 @@
         return candidates[candidates.length - 1];
     };
 
-    const initRecorder = async (isHEVC = false, srcWidth = null, srcHeight = null, framerate = null) => {
-        // 导出帧率必须与 PTS 计算所用的帧率一致（见 startRecording 的 activeFps）。
-        // 不能直接用全局 fps：它由 setupPreview 设为「当前预览片段」的帧率，
-        // 多段合并且各段 fps 不同时会导致输出时长/播放速度错误。
-        const exportFps = (typeof framerate === 'number' && framerate > 0) ? framerate : fps;
-
-        if (!supportsWebCodecs) {
-            const layout = getCompositeLayout(
-                srcWidth != null ? srcWidth : (vid ? vid.videoWidth : 0),
-                srcHeight != null ? srcHeight : (vid ? vid.videoHeight : 0),
-                EXPORT_MAX_WIDTH
-            );
-            exportWidth = layout.width;
-            exportHeight = layout.height;
-            compositeSplitBelow = layout.splitBelow;
-            if (cvs.width !== exportWidth || cvs.height !== exportHeight) {
-                cvs.width = exportWidth;
-                cvs.height = exportHeight;
-            }
-            cachedCanvasWidth = -1;
-            cachedCanvasHeight = -1;
-            textTextureInitialized = false;
-
-            const stream = cvs.captureStream(exportFps);
-            const mimeCandidates = [
-                'video/mp4;codecs="avc1.640028"',
-                'video/mp4;codecs="avc1.42E01E"',
-                'video/webm;codecs=vp9',
-                'video/webm;codecs=vp8',
-                'video/webm'
-            ];
-            const mime = mimeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || 'video/webm';
-            console.log('MediaRecorder fallback mime:', mime);
-            mediaRecorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: targetBitrate });
-            const chunks = [];
-            mediaRecorderStopPromise = null;
-            mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
-            mediaRecorder.onstop = () => {
-                const blob = new Blob(chunks, { type: mime });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                const ext = mime.includes('webm') ? 'webm' : 'mp4';
-                a.download = `${vidName}_stamp.${ext}`;
-                a.click();
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
-                if (mediaRecorderStopPromise) {
-                    mediaRecorderStopPromise.resolve();
-                    mediaRecorderStopPromise = null;
-                }
-            };
-            mediaRecorder.onerror = (event) => {
-                console.warn('MediaRecorder error:', event);
-                if (mediaRecorderStopPromise) {
-                    mediaRecorderStopPromise.reject(new Error('MediaRecorder error'));
-                    mediaRecorderStopPromise = null;
-                }
-            };
-            mediaRecorder.start();
-            return true;
-        }
-
-        if (!window.VideoEncoder) return false;
-
-        const inWidth = srcWidth != null ? srcWidth : (vid ? vid.videoWidth : 0);
-        const inHeight = srcHeight != null ? srcHeight : (vid ? vid.videoHeight : 0);
+    /**
+     * 创建 VideoEncoder + Mp4Muxer，并把画布切换到导出分辨率。
+     * @param {boolean} isHEVC   源为 HEVC 时优先尝试 HEVC 编码，不支持则回落 AVC
+     * @param {number}  inWidth  源视频宽（首段）
+     * @param {number}  inHeight 源视频高（首段）
+     * @param {number}  exportFps 导出帧率，必须与 startRecording 计算 PTS 所用的 activeFps 一致
+     *
+     * 曾有一条 MediaRecorder(captureStream) 回退路径，但按钮启用条件（checkCapabilities）
+     * 与帧驱动循环（VideoDecoder）都要求 WebCodecs，该路径实际不可达，已移除。
+     */
+    const initRecorder = async (isHEVC, inWidth, inHeight, exportFps) => {
         const layout = getCompositeLayout(inWidth, inHeight, EXPORT_MAX_WIDTH);
         exportWidth = layout.width;
         exportHeight = layout.height;
@@ -822,7 +761,6 @@
             codec: encoderCodec, width: exportWidth, height: exportHeight,
             bitrate: targetBitrate, framerate: exportFps
         });
-        return true;
     };
 
     const maybeEncode = (frame, options = {}) => {
@@ -838,7 +776,7 @@
         if (startRequestPending || isRecording) return;
         startRequestPending = true;
         try {
-            if (!clips || clips.length === 0 || !window.VideoDecoder) return;
+            if (clips.length === 0 || !checkCapabilities()) return;
             const isMerge = clips.length > 1;
             const refClip = clips[0];
             if (!isMerge && vid && vid.currentTime >= vid.duration) vid.currentTime = 0;
@@ -851,12 +789,7 @@
             // 此前它被放在 initRecorder 之后并被下一行的「正在合成」同步覆盖，从未真正绘制过。
             currentStatusKey = 'statusPreparing'; currentStatusArg = null; currentStatusIsRec = true;
             updateStatus(t('statusPreparing'), true);
-            if (!(await initRecorder(isHEVC, refClip.config.width, refClip.config.height, activeFps))) {
-                currentStatusKey = 'statusReady'; currentStatusArg = null; currentStatusIsRec = false;
-                updateStatus(t('statusReady'));
-                updateStartButtonState();
-                return;
-            }
+            await initRecorder(isHEVC, refClip.config.width, refClip.config.height, activeFps);
 
             if (vid) vid.pause();
 
@@ -993,14 +926,10 @@
                         hardwareAcceleration: 'no-preference'
                     });
 
+                    // 解码起点：默认从头（首段首帧非关键帧时，由下方 hasSeenKeyFrame 跳过前导 delta 帧）；
+                    // 首段指定了录制起点时，回退到起点之前最近的关键帧
                     let hasSeenKeyFrame = false;
                     let startIdx = 0;
-                    if (clipOrdinal === 0) {
-                        // 首段始终从首个关键帧开始解码，避免首帧非关键帧导致的黑屏/绿屏
-                        for (let i = 0; i < samples.length; i++) {
-                            if (samples[i].type === 'key') { startIdx = i; break; }
-                        }
-                    }
                     if (clipOrdinal === 0 && recordingStartTime > 0) {
                         const startTimeUs = recordingStartTime * 1000000;
                         let lastKeyIdx = 0;
@@ -1016,6 +945,7 @@
                         const s = samples[i];
                         const isKeyFrame = s.type === 'key';
 
+                        // 关键帧之前的 delta 帧无法解码（黑屏/绿屏），一律跳过
                         if (!hasSeenKeyFrame && !isKeyFrame) {
                             continue;
                         }
@@ -1118,19 +1048,6 @@
                 }
                 if (encoder.state !== 'closed') encoder.close();
             }
-            if (mediaRecorder) {
-                await new Promise((resolve, reject) => {
-                    if (mediaRecorder.state === 'recording') {
-                        mediaRecorderStopPromise = { resolve, reject };
-                        mediaRecorder.stop();
-                    } else {
-                        resolve();
-                    }
-                }).catch((e) => {
-                    console.warn('MediaRecorder stop failed:', e);
-                });
-                mediaRecorder = null;
-            }
             if (muxer) {
                 muxer.finalize();
                 const { buffer } = muxer.target;
@@ -1180,7 +1097,8 @@
         if (!source || (!sourceFrame && source.readyState < 2)) return;
 
         const currentTime = forcedTime ?? vid.currentTime;
-        const ctx = currentClipContext || { videoStartTime, parsedFrames, fps };
+        // setupPreview 在创建 <video> 之前就已设置 currentClipContext，能走到这里它必然非空
+        const ctx = currentClipContext;
 
         // 1. Sync dimensions & Text Canvas sizing
         if (cvs.width !== cachedCanvasWidth || cvs.height !== cachedCanvasHeight) {
@@ -1244,23 +1162,9 @@
                 accelNum = Math.round(sei.acceleratorPedalPosition || 0);
                 speedVal = speed.toString();
 
-                const rawGear = sei.gearState;
-                if (enumFields && enumFields.gearState && enumFields.gearState.valuesById && rawGear in enumFields.gearState.valuesById) {
-                    const valName = enumFields.gearState.valuesById[rawGear];
-                    if (valName === "DRIVE") gearStr = "D";
-                    else if (valName === "REVERSE") gearStr = "R";
-                    else if (valName === "NEUTRAL") gearStr = "N";
-                    else if (valName === "PARK") gearStr = "P";
-                } else if (typeof rawGear === 'number') {
-                    if (rawGear === 1) gearStr = "D";
-                    else if (rawGear === 2) gearStr = "R";
-                    else if (rawGear === 3) gearStr = "N";
-                    else gearStr = "P";
-                } else if (typeof rawGear === 'string') {
-                    if (rawGear.includes("DRIVE")) gearStr = "D";
-                    else if (rawGear.includes("REVERSE")) gearStr = "R";
-                    else if (rawGear.includes("NEUTRAL")) gearStr = "N";
-                    else gearStr = "P";
+                // decodeSei 已把 gearState 归一为枚举数字，经 proto 枚举名映射为档位字母；未知值按 P 处理
+                if (enumFields && enumFields.gearState) {
+                    gearStr = GEAR_LETTERS[enumFields.gearState.valuesById[sei.gearState]] || "P";
                 }
 
                 isLeftBlinkerOn = !!sei.blinkerOnLeft;
@@ -1444,10 +1348,6 @@
             vid.pause();
             if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
         }
-        currentParser = clip.parser;
-        parsedFrames = clip.parsedFrames;
-        videoStartTime = clip.videoStartTime;
-        fps = clip.fps;
         firstKeyFrameTime = clip.firstKeyFrameTime;
         firstPlayLock = !autoPlay;
         // 注意：vidName / originalFileLastModified 是「输出文件」的元信息，只由 handleFiles 依据首段设置一次；
@@ -1561,7 +1461,7 @@
         nextVid.onwaiting = handleStall;
         nextVid.onstalled = handleStall;
 
-        if (currentVideoUrl) { try { URL.revokeObjectURL(currentVideoUrl); } catch (e) { } }
+        // 旧的 blob URL 已在 createFreshVideo() 中撤销
         currentVideoUrl = URL.createObjectURL(clip.file);
         nextVid.src = currentVideoUrl;
         vid = nextVid;
@@ -1645,9 +1545,10 @@
         if (videoFiles.length === 0) return;
 
         syncPlayButton(true);
-        fps = 36;
         cachedCanvasWidth = -1; cachedCanvasHeight = -1;
         textTextureInitialized = false;
+        // 图标缓存按渲染尺寸建键，换视频（分辨率可能变化）时清空，避免旧尺寸条目滞留
+        TelemetryRenderer.clearIconCache();
         videoViewer.style.display = "block"; dropZone.style.display = "none";
         currentStatusKey = 'statusParsing'; currentStatusArg = null; currentStatusIsRec = false;
         updateStatus(t('statusParsing'));
@@ -1655,8 +1556,7 @@
         const parsed = [];
         for (const f of videoFiles) {
             try {
-                const c = await MergeManager.prepareClip(f);
-                if (c) parsed.push(c);
+                parsed.push(await MergeManager.prepareClip(f));
             } catch (e) {
                 console.error("解析视频失败:", f.name, e);
             }
@@ -1671,15 +1571,14 @@
         }
 
         clips = MergeManager.sortClips(parsed);
-        for (const c of clips) c.targetBitrate = computeTargetBitrate(c);
         mergeAnalysis = MergeManager.analyzeClips(clips);
         computeMergedTimeline();
 
-        // 输出文件的元信息一律取自首段（时间基准 / 文件名 / lastModified），与预览到哪一段无关
-        originalMediaDate = Math.floor(clips[0].videoStartTime / 1000) + MP4_EPOCH_OFFSET;
+        // 输出文件的元信息一律取自首段（时间基准 / 文件名 / lastModified / 码率），与预览到哪一段无关
+        originalMediaDate = Math.floor(clips[0].videoStartTime / 1000) + DashcamHelpers.MP4_EPOCH_OFFSET;
         vidName = clips[0].name + (clips.length > 1 ? '_merged' : '');
         originalFileLastModified = clips[0].lastModified;
-        targetBitrate = clips[0].targetBitrate;
+        targetBitrate = computeTargetBitrate(clips[0]);
         currentClipContext = clips[0];
 
         await setupPreview(clips[0]);
@@ -1687,7 +1586,7 @@
     };
 
     const updateStartButtonState = () => {
-        if (!clips || clips.length === 0) { startRecBtn.disabled = true; return; }
+        if (clips.length === 0) { startRecBtn.disabled = true; return; }
         const capOk = checkCapabilities();
         const resOk = mergeAnalysis ? mergeAnalysis.resolutionOk : true;
         startRecBtn.disabled = !(capOk && resOk);
@@ -1803,10 +1702,10 @@
     };
 
     if (timeSlider) {
-        // 统一的全局时间定位：live=true 表示拖动过程中（oninput），false 表示松手（onchange）
+        // 拖动过程中（oninput）的全局时间定位。
         // 跨片段拖动时「立即」切换视频源并在目标位置定位，使预览在拖动过程中实时跟随进度条，
         // 而不是停在旧片段的末帧/首帧直到松手。
-        const applyGlobalScrub = (live) => {
+        const applyGlobalScrub = () => {
             const gt = sliderToGlobalTime(timeSlider.value);
             timeDisplay.textContent = `${formatTime(gt)} / ${formatTime(mergedTotalDuration)}`;
             const { i, localTime } = findClipForGlobalTime(gt);
@@ -1819,7 +1718,7 @@
                 // 本段内：实时拖动预览
                 pendingClipSwitch = null;
                 scrubTarget = clamped;
-                if (live && !scrubRaf) {
+                if (!scrubRaf) {
                     lastScrubTime = 0;
                     scrubRaf = requestAnimationFrame(scrubLoop);
                 }
@@ -1837,7 +1736,7 @@
 
         timeSlider.oninput = () => {
             dragging = true;
-            applyGlobalScrub(true);
+            applyGlobalScrub();
         };
 
         timeSlider.onchange = () => {
